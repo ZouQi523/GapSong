@@ -1,0 +1,14 @@
+Generated with the built-in image_gen tool.
+
+Initial prompt:
+Use case: logo-brand
+Asset type: primary macOS application icon for GapSong, a floating Apple Music lyrics companion that turns song lyrics into English fill-in-the-blank listening exercises.
+Primary request: create ONE finished, highly distinctive minimalist app icon, not a presentation or sheet of concepts.
+Design: a bold, beautifully balanced paired musical eighth-note symbol. The left note has a conventional solid oval notehead; the right notehead is cleverly replaced by a mint-green horizontal rounded underscore / empty-answer slot. Integrate this missing-word bar into the musical symbol so the icon communicates both music and a lyric blank. Strong simple connected silhouette, generous negative space, thick clean stems and beam, precise optical balance, instantly readable at 32 pixels.
+Color palette: use ONLY three flat solid design colors: near-black #111315 background, warm white #F5F4EF main musical symbol, mint green #68D391 answer-slot accent. No gradients, no lighting, no texture, no extra colors. Antialiasing along shape edges only.
+Composition: square 1024x1024 canvas; near-black background fills the entire canvas all the way to every edge. Center the large mark with approximately 22 percent generous padding. Flat vector-like geometric craftsmanship, calm, modern, premium macOS utility personality.
+Text: none. No letters, no app name, no watermark.
+Avoid: additional decorative symbols, book drawings, headphones, play buttons, Apple logo, Apple Music branding, tiny details, mockup devices, 3D, shadows, glossy effects, outlines, multiple variants, surrounding white margin.
+
+Refinement prompt:
+Use case: precise-object-edit. Edit this GapSong app icon. Preserve the exact musical symbol design, geometry, placement and mint green answer-slot concept. Change ONLY the surfaces to perfectly uniform flat solid fills. Use at most THREE colors total in all flat regions: #111315 background, #F5F4EF note, #68D391 rounded answer bar. Remove every trace of texture, grain, paper fibers, lighting, shadow, vignette and gradient; especially the green bar must be one identical RGB color everywhere inside its contour. Background must be one identical RGB color edge to edge, white symbol one identical RGB color. Crisp vector-like edges with edge antialiasing only. No added elements or text. Deliver one square icon.

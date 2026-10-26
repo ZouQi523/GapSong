@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔐 报告安全漏洞
+    url: https://github.com/ZouQi523/GapSong/security/advisories/new
+    about: 请不要公开开 Issue，按 SECURITY.md 私下报告。
+  - name: 📖 贡献指南
+    url: https://github.com/ZouQi523/GapSong/blob/main/CONTRIBUTING.md
+    about: 构建、测试与 PR 约定。

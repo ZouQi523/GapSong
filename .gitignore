@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build output / caches
+build/
+.modulecache/
+DerivedData/
+
+# Xcode / SwiftPM
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+.swiftpm/
+Package.resolved
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Logs and generated snapshots
+*.log
+retry.png
+
+# Local secrets
+.env
+.env.*
+
+# Internal collaboration reports
+/docs/parallel/

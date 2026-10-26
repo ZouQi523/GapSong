@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (macOS 15)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          swiftc --version
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Offscreen render smoke test
+        run: |
+          ./build/GapSong.app/Contents/MacOS/GapSong --snapshot /tmp/gap-compact.png
+          ./build/GapSong.app/Contents/MacOS/GapSong --snapshot-practice /tmp/gap-practice.png
+          ls -lh /tmp/gap-*.png
+
+      - name: Verify icon & signature
+        run: |
+          test -f build/GapSong.app/Contents/Resources/AppIcon.icns
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" build/GapSong.app/Contents/Info.plist
+          codesign --verify --strict build/GapSong.app
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: GapSong
+          path: build/GapSong.zip
+          if-no-files-found: error

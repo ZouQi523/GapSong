@@ -1,0 +1,51 @@
+name: ✨ 功能建议
+description: 想要的新能力或改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先描述「问题」，再描述「方案」，这样更容易判断是否值得做。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的问题
+      description: 现在哪里不顺手？在什么场景下？
+      placeholder: "例如：练习时想只练某几个词，但空格切换不够直观……"
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望的方案
+      placeholder: "你希望它怎么工作？有没有交互草图或参考？"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      options:
+        - 歌词 / 翻译
+        - 练习 / 判分
+        - 题库
+        - 窗口 / 菜单 / 快捷键
+        - 构建 / 发布
+        - 其他
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已经搜索过现有 Issue 和 Roadmap
+          required: true

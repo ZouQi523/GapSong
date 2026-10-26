@@ -1,0 +1,88 @@
+name: 🐛 Bug 报告
+description: 某个功能不正常、崩溃或显示错误
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先搜索已有 Issue，并去掉日志/截图里的个人信息。
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS 版本
+      placeholder: "15.1 (24B83)"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: GapSong 版本
+      description: Release tag，或 `defaults read com.gapsong.app` 里的版本
+      placeholder: "0.4.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出问题的环节
+      options:
+        - 歌词 / 翻译
+        - 练习（当前歌曲）
+        - 练习（题库）
+        - 题库收藏
+        - 窗口 / 菜单
+        - 构建 / 启动
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 诊断日志（可选）
+      description: "`~/Library/Caches/GapSong/diag.log` 末尾 50 行，记得脱敏"
+      render: shell
+
+  - type: input
+    id: music
+    attributes:
+      label: 歌曲 / 歌手（可选）
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已经搜索过现有 Issue
+          required: true
+        - label: 日志和截图里不含隐私信息
+          required: true
