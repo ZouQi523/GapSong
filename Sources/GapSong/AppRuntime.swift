@@ -20,12 +20,19 @@ enum AppRuntime {
     }
 
     /// 自检/快照使用的独立偏好 suite；正常启动仍然使用标准偏好。
+    ///
+    /// 同一个进程里只创建并清空一次：歌词窗位置等模块会反复取这份 defaults，
+    /// 每次都 `removePersistentDomain` 会把当前会话刚写下的设置抹掉。
     static func settingsDefaults() -> UserDefaults {
         guard isIsolated else { return .standard }
+        if let cached = cachedIsolatedDefaults { return cached }
         let name = "gapsong.isolated.\(ProcessInfo.processInfo.processIdentifier)"
         // 极端情况下 suite 创建失败也绝不回落到真实偏好
         let defaults = UserDefaults(suiteName: name) ?? UserDefaults(suiteName: "gapsong.isolated.fallback")!
         defaults.removePersistentDomain(forName: name)
+        cachedIsolatedDefaults = defaults
         return defaults
     }
+
+    private static var cachedIsolatedDefaults: UserDefaults?
 }

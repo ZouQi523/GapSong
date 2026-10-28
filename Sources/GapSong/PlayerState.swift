@@ -49,6 +49,9 @@ final class PlayerState: ObservableObject {
 
     func setHint(_ s: String?) { hint = s }
 
+    /// 播放已经恢复正常时清掉过期的授权/控制提示
+    func clearHint() { hint = nil }
+
     func setTranslationEnabled(_ on: Bool) {
         translationEnabled = on
         guard on, let lyrics else { return }
@@ -152,5 +155,26 @@ extension PlayerState {
         self.lyricsGeneration += 1
         self.loadState = .loaded
         self.translator.debugSetTranslations(translations)
+    }
+
+    /// 自检/演示：只改播放位置与状态，不动歌词（用来模拟手动暂停、卡住、播完）
+    func debugSetPlayback(
+        position: TimeInterval,
+        playing: Bool,
+        sampledAt: Date = Date(),
+        duration: TimeInterval? = nil
+    ) {
+        guard var snap = snapshot else { return }
+        if let duration { snap.track.duration = duration }
+        snap.position = position
+        snap.playing = playing
+        snap.sampledAt = sampledAt
+        snapshot = snap
+    }
+
+    /// 自检/演示：模拟「音乐」不再提供任何采样
+    func debugClearSnapshot() {
+        currentKey = nil
+        snapshot = nil
     }
 }

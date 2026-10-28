@@ -29,7 +29,14 @@ final class OverlayController {
     private var cancellables: Set<AnyCancellable> = []
     private var isApplyingSize = false
 
-    private static let minSize = NSSize(width: 420, height: 110)
+    /// 练习态需要能放下设置页/答题/揭示/结束四套内容，歌词态保持紧凑 420×110
+    static func minSize(practice: Bool) -> NSSize {
+        practice
+            ? NSSize(width: Settings.practiceMinSize.width, height: Settings.practiceMinSize.height)
+            : NSSize(width: Settings.lyricMinSize.width, height: Settings.lyricMinSize.height)
+    }
+
+    private var currentMinSize: NSSize { Self.minSize(practice: settings.practiceMode) }
 
     init(
         state: PlayerState,
@@ -51,9 +58,10 @@ final class OverlayController {
             )
         )
 
+        let minSize = Self.minSize(practice: settings.practiceMode)
         let initial = NSSize(
-            width: max(Self.minSize.width, settings.panelWidth),
-            height: max(Self.minSize.height, settings.panelHeight)
+            width: max(minSize.width, settings.panelWidth),
+            height: max(minSize.height, settings.panelHeight)
         )
 
         panel = LyricPanel(
@@ -70,7 +78,7 @@ final class OverlayController {
         panel.hidesOnDeactivate = false
         panel.animationBehavior = .utilityWindow
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        panel.minSize = Self.minSize
+        panel.minSize = minSize
         panel.isReleasedWhenClosed = false
 
         // 关键：不要让 NSHostingView 的 Auto Layout / 固有尺寸反过来改窗口大小
@@ -137,14 +145,16 @@ final class OverlayController {
 
     private func applySettings() {
         panel.isMovableByWindowBackground = !settings.locked
+        panel.minSize = currentMinSize
         applySize()
         setVisible(settings.visible)
     }
 
     private func applySize() {
+        let minSize = currentMinSize
         let target = NSSize(
-            width: max(Self.minSize.width, settings.panelWidth),
-            height: max(Self.minSize.height, settings.panelHeight)
+            width: max(minSize.width, settings.panelWidth),
+            height: max(minSize.height, settings.panelHeight)
         )
         let current = panel.frame.size
         guard abs(current.width - target.width) > 0.5 || abs(current.height - target.height) > 0.5 else { return }
@@ -160,7 +170,7 @@ final class OverlayController {
     }
 
     private func restorePosition() {
-        let d = UserDefaults.standard
+        let d = settings.store
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let size = panel.frame.size
 
@@ -177,7 +187,7 @@ final class OverlayController {
 
     private func savePosition() {
         guard panel.isVisible else { return }
-        let d = UserDefaults.standard
+        let d = settings.store
         d.set(Double(panel.frame.origin.x), forKey: "panelX")
         d.set(Double(panel.frame.origin.y), forKey: "panelY")
     }

@@ -20,16 +20,43 @@ protocol MusicControlling: AnyObject {
     func seek(to seconds: TimeInterval, play: Bool)
 }
 
+/// 与「音乐」通信时的具体问题：练习界面要据此区分授权失败、控制失败和播放中断
+enum MusicProblem: Equatable {
+    case unauthorized
+    case controlFailed(Int)
+    case readFailed(Int)
+
+    var message: String {
+        switch self {
+        case .unauthorized:
+            return "需要授权控制「音乐」：系统设置 › 隐私与安全性 › 自动化"
+        case .controlFailed(let code):
+            return "控制音乐失败（\(code)）"
+        case .readFailed(let code):
+            return "读取音乐播放状态失败（\(code)）"
+        }
+    }
+}
+
+/// 能报告播放问题的播放器（真实 MusicWatcher 实现；测试替身可自行注入）
+protocol MusicProblemReporting: AnyObject {
+    var onProblemKind: ((MusicProblem) -> Void)? { get set }
+}
+
 /// 通过 AppleScript 读取 Music.app 的播放状态
 final class MusicWatcher {
     var onSnapshot: ((MusicSnapshot?) -> Void)?
     var onProblem: ((String) -> Void)?
+    var onProblemKind: ((MusicProblem) -> Void)?
+    /// 采样恢复正常（之前报过问题）
+    var onRecovered: (() -> Void)?
 
     private let queue = DispatchQueue(label: "com.gapsong.music", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var script: NSAppleScript?
     private var commandScripts: [String: NSAppleScript] = [:]
-    private var reportedProblem = false
+    private var lastReported: MusicProblem?
+    private var lastReportedAt = Date.distantPast
 
     private static let source = """
     with timeout of 4 seconds
@@ -84,13 +111,15 @@ final class MusicWatcher {
         if let err {
             let code = (err[NSAppleScript.errorNumber] as? Int) ?? 0
             if code == -1743 {
-                reportOnce("需要授权控制「音乐」：系统设置 › 隐私与安全性 › 自动化")
+                report(.unauthorized)
             } else if code != -1712 {
-                reportOnce("读取音乐播放状态失败（\(code)）")
+                report(.readFailed(code))
             }
             return
         }
 
+        // 采样成功：清掉上次的问题，之后再坏一次还能重新报
+        clearProblem()
         deliver(Self.snapshot(from: result))
     }
 
@@ -187,9 +216,9 @@ final class MusicWatcher {
     private func reportControlError(_ err: NSDictionary) {
         let code = (err[NSAppleScript.errorNumber] as? Int) ?? 0
         if code == -1743 {
-            reportOnce("需要授权控制「音乐」：系统设置 › 隐私与安全性 › 自动化")
+            report(.unauthorized)
         } else {
-            reportOnce("控制音乐失败（\(code)）")
+            report(.controlFailed(code))
         }
     }
 
@@ -199,14 +228,44 @@ final class MusicWatcher {
         }
     }
 
-    private func reportOnce(_ msg: String) {
-        guard !reportedProblem else { return }
-        reportedProblem = true
-        DispatchQueue.main.async { [weak self] in self?.onProblem?(msg) }
+    private func clearProblem() {
+        let hadProblem = lastReported != nil
+        lastReported = nil
+        // 采样恢复正常：让界面把过期的授权/控制提示收掉
+        if hadProblem {
+            DispatchQueue.main.async { [weak self] in self?.onRecovered?() }
+        }
+    }
+
+    /// 同一个问题不重复刷屏；但采样恢复后再坏一次仍会重新上报
+    private func report(_ problem: MusicProblem) {
+        // 同一个问题两分钟内不重复刷屏；采样恢复过（clearProblem）则立刻可以再报
+        if lastReported == problem, Date().timeIntervalSince(lastReportedAt) < 120 { return }
+        lastReported = problem
+        lastReportedAt = Date()
+        Diag.log("music: problem \(problem)")
+        DispatchQueue.main.async { [weak self] in
+            self?.onProblem?(problem.message)
+            self?.onProblemKind?(problem)
+        }
     }
 }
 
 extension MusicWatcher: MusicControlling {}
+
+// MARK: - 自检注入：走与真实失败完全相同的上报路径
+
+extension MusicWatcher {
+    /// 自检用：模拟一次采样层的授权/控制失败（不触碰真实 Music）
+    func debugReport(_ problem: MusicProblem) {
+        report(problem)
+    }
+
+    /// 自检用：模拟采样恢复正常
+    func debugReportRecovered() {
+        clearProblem()
+    }
+}
 
 /// 预览/测试用：不下发任何真实命令
 final class NoopMusicController: MusicControlling {

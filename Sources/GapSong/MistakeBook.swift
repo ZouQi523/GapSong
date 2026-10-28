@@ -304,27 +304,45 @@ final class MistakeBook: ObservableObject {
         var entries: [MistakeEntry]
     }
 
+    /// 只认当前版本；版本号不认识时按损坏文件保护，不静默改写历史
+    private static let storeVersion = 1
+
     private func load() {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return }
+        guard !isDirectory.boolValue else {
+            readOnly = true
+            loadError = "错题本路径是一个目录，无法作为文件读取；为避免破坏历史，本次运行不会写入错题本。"
+            Diag.log("mistakes: load blocked (path is a directory)")
+            return
+        }
+
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         do {
             let data = try Data(contentsOf: url)
             if let store = try? decoder.decode(Store.self, from: data) {
+                guard store.version == Self.storeVersion else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
                 entries = store.entries
             } else {
-                // 兼容将来/早期可能的裸数组格式
+                // 兼容早期可能的裸数组格式
                 entries = try decoder.decode([MistakeEntry].self, from: data)
             }
             loadError = nil
             Diag.log("mistakes: loaded \(entries.count) 条 / \(totalAttempts) 次")
         } catch {
-            // 读失败：先复制一份原始文件，再允许后续写新文件；备份失败则只读保护
+            // 读失败：先复制一份原始文件并逐字节核对，再允许后续写新文件；备份失败则只读保护
             let stamp = "\(Self.timestamp())-\(UUID().uuidString.prefix(6))"
             let backup = url.deletingLastPathComponent()
                 .appendingPathComponent("mistakes.corrupt-\(stamp).json")
             do {
+                let original = try Data(contentsOf: url)
                 try FileManager.default.copyItem(at: url, to: backup)
+                guard let copied = try? Data(contentsOf: backup), copied == original else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
                 backupURL = backup
                 loadError = "错题本读取失败，原始文件已备份为 \(backup.lastPathComponent)。后续错误会写入新文件，旧记录不会丢失。"
                 Diag.log("mistakes: load failed \(error); backed up to \(backup.path)")
@@ -346,12 +364,16 @@ final class MistakeBook: ObservableObject {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         do {
-            let store = Store(version: 1, entries: entries)
+            let store = Store(version: Self.storeVersion, entries: entries)
             let data = try encoder.encode(store)
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true
             )
             try data.write(to: url, options: .atomic)
+            // 写完读回核对：不能因为路径被占用/不可写而假报保存成功
+            guard let written = try? Data(contentsOf: url), written == data else {
+                throw CocoaError(.fileWriteUnknown)
+            }
             saveError = nil
             return true
         } catch {

@@ -10,12 +10,13 @@ struct PracticeView: View {
     @ObservedObject var bank: QuestionBank
     @ObservedObject var mistakes: MistakeBook
 
-    @FocusState private var inputFocused: Bool
     /// 离屏渲染画不了 AppKit 控件，预览时用 Text 顶替输入框
     @Environment(\.practicePreview) private var preview
 
     /// 点开释义的词（预览时可由外部预置）
     @State private var selectedWord: String?
+    /// 每次 +1 让隐藏输入视图重新成为第一响应者（AppKit 视图不走 @FocusState）
+    @State private var focusNonce = 0
 
     init(
         state: PlayerState,
@@ -37,85 +38,124 @@ struct PracticeView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let s = scale(for: geo.size)
-            VStack(spacing: 9 * s) {
-                header(s)
+            let s = PracticeStyle.windowScale(width: geo.size.width, height: geo.size.height)
+            // 顶部来源/进度与底部数字操作各占固定区域；只有中间题面滚动。
+            // 短内容在可用区域里水平+垂直居中，内容高于可用高度时从顶部正常滚动。
+            VStack(spacing: 7 * s) {
+                VStack(alignment: .leading, spacing: 6 * s) {
+                    header(s)
+                    storageWarnings()
+                    scoreBar(s)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
                 Divider().overlay(Color.white.opacity(0.08))
-                scoreBar(s)
-                Spacer(minLength: 0)
-                stage(s)
-                Spacer(minLength: 0)
+
+                centerStage(s)
+
+                speechNotice(s)
+                issueActions(s)
+                returnHint(s)
                 actions(s)
             }
-            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
         }
         .onChange(of: engine.phase) { _, newValue in
             selectedWord = nil
-            if newValue == .asking {
-                DispatchQueue.main.async { inputFocused = true }
+            // 换阶段就停掉上一句朗读，绝不把旧句读进下一屏
+            engine.stopReading()
+            if newValue == .asking || newValue == .listening {
+                focusNonce += 1
             }
+        }
+        .onChange(of: engine.focusTick) { _, _ in
+            focusNonce += 1
         }
         .onChange(of: engine.current?.id) { _, _ in
             selectedWord = nil
+            engine.stopReading()
+        }
+        .onChange(of: engine.source) { _, _ in
+            engine.stopReading()
         }
         .onAppear {
-            if engine.phase == .asking {
-                DispatchQueue.main.async { inputFocused = true }
+            if engine.phase == .asking || engine.phase == .listening {
+                focusNonce += 1
             }
         }
-        .onChange(of: inputFocused) { _, focused in
-            Diag.log("practice: input focus \(focused)")
+        .onDisappear {
+            // 退出练习/回设置页时不留后台朗读
+            engine.stopReading()
         }
-        // Esc 退出练习。走 onExitCommand 而不是 keyboardShortcut，
-        // 这样输入法组字时 Esc 先给输入法用，不会误退出。
+        // Esc 仍然兼容；主提示改用 6 返回
         .onExitCommand {
-            settings.practiceMode = false
+            engine.exitPractice()
         }
     }
 
-    /// 字号随窗口等比缩放：小窗不挤，大窗不空
-    private func scale(for size: CGSize) -> CGFloat {
-        guard size.width > 1, size.height > 1 else { return 1 }
-        let base = min(size.width / 720, size.height / 300)
-        return min(max(base, 0.8), 1.7)
+    // MARK: 固定区域与居中题面
+
+    /// 题面所在的中间区域：内容短时垂直居中，内容高于可用高度时从顶部滚动。
+    private func centerStage(_ s: CGFloat) -> some View {
+        GeometryReader { area in
+            ScrollView(.vertical) {
+                VStack(spacing: 9 * s) {
+                    stage(s)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6 * s)
+                .frame(minHeight: area.size.height, alignment: .center)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
     }
+
+    /// 菜单「字号」的正文系数（默认 24 = 1）。窗口缩放 `s` 仍然负责让内容
+    /// 适配窗口；这个系数只叠加在正文/填空/提示的字号上。
+    private var fontFactor: CGFloat { Settings.practiceFontFactor(settings.fontSize) }
 
     // MARK: 顶部
 
     private func header(_ s: CGFloat) -> some View {
         HStack(spacing: 8 * s) {
-            Color.clear.frame(width: 12 * s, height: 1)   // 给左上角关闭按钮留位
+            Color.clear.frame(width: max(14, 12 * s), height: 1)   // 给左上角关闭按钮留位
 
             if !engine.source.badge.isEmpty {
                 Text(engine.source.badge)
-                    .font(.system(size: 9 * s, weight: .semibold))
+                    .font(.system(size: PracticeStyle.caption(s, base: 9), weight: .semibold))
                     .padding(.horizontal, 5 * s)
                     .padding(.vertical, 1.5 * s)
                     .background(Capsule().fill(Color.white.opacity(0.1)))
-                    .foregroundStyle(.white.opacity(0.65))
+                    .foregroundStyle(PracticeStyle.Ink.secondary)
             }
 
             Text(engine.sourceTitle.isEmpty ? "—" : engine.sourceTitle)
-                .font(.system(size: 11 * s, weight: .medium))
-                .foregroundStyle(.white.opacity(0.55))
+                .font(.system(size: PracticeStyle.caption(s, base: 11), weight: .medium))
+                .foregroundStyle(PracticeStyle.Ink.secondary)
                 .lineLimit(1)
             Text("·")
-                .font(.system(size: 11 * s))
+                .font(.system(size: PracticeStyle.caption(s, base: 11)))
                 .foregroundStyle(.white.opacity(0.25))
             Text(engine.sourceArtist)
-                .font(.system(size: 11 * s))
-                .foregroundStyle(.white.opacity(0.4))
+                .font(.system(size: PracticeStyle.caption(s, base: 11)))
+                .foregroundStyle(PracticeStyle.Ink.muted)
                 .lineLimit(1)
 
             Spacer(minLength: 8)
 
-            favoriteButton(s)
-
             if !engine.progress.isEmpty {
                 Text(engine.progress)
-                    .font(.system(size: 10 * s).monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.35))
+                    .font(.system(size: PracticeStyle.caption(s, base: 10)).monospacedDigit())
+                    .foregroundStyle(PracticeStyle.Ink.muted)
             }
+        }
+    }
+
+    /// 收藏/错题写失败要在练习界面里看得见
+    @ViewBuilder
+    private func storageWarnings() -> some View {
+        if let warning = bank.storageWarning ?? mistakes.storageWarning {
+            StorageWarningBanner(text: warning)
         }
     }
 
@@ -125,27 +165,27 @@ struct PracticeView: View {
             Text("\(engine.score)")
                 .font(.system(size: 26 * s, weight: .bold, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(.white.opacity(0.92))
+                .foregroundStyle(PracticeStyle.Ink.primary)
                 .contentTransition(.numericText())
 
             Text("分")
-                .font(.system(size: 11 * s))
-                .foregroundStyle(.white.opacity(0.35))
+                .font(.system(size: PracticeStyle.caption(s, base: 11)))
+                .foregroundStyle(PracticeStyle.Ink.muted)
                 .padding(.top, 7 * s)
 
             if engine.streak >= 2 {
                 Text("连对 \(engine.streak)")
-                    .font(.system(size: 10 * s, weight: .medium))
+                    .font(.system(size: PracticeStyle.caption(s, base: 10), weight: .medium))
                     .padding(.horizontal, 7 * s)
                     .padding(.vertical, 2.5 * s)
                     .background(Capsule().fill(Color.white.opacity(0.12)))
-                    .foregroundStyle(.white.opacity(0.8))
+                    .foregroundStyle(PracticeStyle.Ink.secondary)
                     .padding(.top, 4 * s)
             }
 
             if engine.isRetry {
                 Text("重试 · 不计分")
-                    .font(.system(size: 10 * s, weight: .medium))
+                    .font(.system(size: PracticeStyle.caption(s, base: 10), weight: .medium))
                     .padding(.horizontal, 7 * s)
                     .padding(.vertical, 2.5 * s)
                     .background(Capsule().fill(Color.orange.opacity(0.16)))
@@ -155,11 +195,11 @@ struct PracticeView: View {
 
             if engine.source == .mistakes {
                 Text("错题 ×\(engine.mistakeAttemptCount(for: engine.current))")
-                    .font(.system(size: 10 * s, weight: .medium))
+                    .font(.system(size: PracticeStyle.caption(s, base: 10), weight: .medium))
                     .padding(.horizontal, 7 * s)
                     .padding(.vertical, 2.5 * s)
                     .background(Capsule().fill(Color.red.opacity(0.16)))
-                    .foregroundStyle(Color(red: 1.0, green: 0.55, blue: 0.5).opacity(0.95))
+                    .foregroundStyle(PracticeStyle.Ink.error)
                     .padding(.top, 4 * s)
             }
 
@@ -191,23 +231,23 @@ struct PracticeView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help("调整听写强度：挖空整句里多少词")
+            .help("填空强度")
         }
     }
 
     private func ratioLabel(_ s: CGFloat) -> some View {
         HStack(spacing: 4 * s) {
             Text("填空 \(settings.practiceRatioLabel)")
-                .foregroundStyle(.white.opacity(0.78))
+                .foregroundStyle(PracticeStyle.Ink.primary)
             if engine.eligibleWordCount > 0 {
                 Text("\(engine.blankWordCount)/\(engine.eligibleWordCount) 词")
-                    .foregroundStyle(.white.opacity(0.3))
+                    .foregroundStyle(PracticeStyle.Ink.tertiary)
             }
             Image(systemName: "chevron.down")
-                .font(.system(size: 7 * s, weight: .bold))
-                .foregroundStyle(.white.opacity(0.35))
+                .font(.system(size: max(8, 7 * s), weight: .bold))
+                .foregroundStyle(PracticeStyle.Ink.tertiary)
         }
-        .font(.system(size: 10.5 * s, weight: .medium))
+        .font(.system(size: PracticeStyle.control(s, base: 10.5), weight: .medium))
         .padding(.horizontal, 8 * s)
         .padding(.vertical, 3.5 * s)
         .background(Capsule().fill(Color.white.opacity(0.09)))
@@ -220,16 +260,20 @@ struct PracticeView: View {
     private func stage(_ s: CGFloat) -> some View {
         switch engine.phase {
         case .setup:
-            Text(engine.notice ?? "选择强度后开始")
-                .font(.system(size: 13 * s))
-                .foregroundStyle(.white.opacity(0.5))
-                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(engine.notice ?? "准备开始")
+                .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 13)))
+                .foregroundStyle(PracticeStyle.Ink.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
 
         case .idle:
-            Text(engine.notice ?? "准备开始…")
-                .font(.system(size: 13 * s))
-                .foregroundStyle(.white.opacity(0.5))
-                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(engine.notice ?? "准备开始")
+                .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 13)))
+                .foregroundStyle(PracticeStyle.Ink.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
 
         case .listening, .asking:
             askingStage(s)
@@ -241,39 +285,54 @@ struct PracticeView: View {
 
     private func askingStage(_ s: CGFloat) -> some View {
         let listening = engine.phase == .listening
+        let issue = engine.playbackNotice
+        let waiting = engine.isWaitingForLineEnd
         return VStack(spacing: 10 * s) {
-            if listening {
+            if let issue {
+                // 播放/授权出问题时，界面必须说清原因，而不是永远停在「正在听」
+                playbackIssueCard(issue, s)
+            } else if waiting {
+                // 已经提前填全对：明确说出「为什么还没切下一句」
+                allCorrectWaitingBanner(s)
+            } else if listening {
                 // 听的时候横线仍然留在原位，用户已经填的内容不会消失
                 HStack(spacing: 8 * s) {
                     Image(systemName: "ear")
-                        .font(.system(size: 14 * s))
-                        .foregroundStyle(.white.opacity(0.5))
+                        .font(.system(size: max(12, 14 * s)))
+                        .foregroundStyle(PracticeStyle.Ink.secondary)
                     Text("正在听这一句…")
-                        .font(.system(size: 16 * s, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.75))
+                        .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 16), weight: .medium))
+                        .foregroundStyle(PracticeStyle.Ink.primary)
                 }
                 .frame(maxWidth: .infinity)
             } else if let hint = chineseHint {
                 Text(hint)
-                    .font(.system(size: 16 * s))
-                    .foregroundStyle(.white.opacity(0.58))
+                    .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 16)))
+                    .foregroundStyle(PracticeStyle.Ink.secondary)
                     .multilineTextAlignment(.center)
                     .lineLimit(3)
+                    .minimumScaleFactor(0.7)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity)
             }
 
             maskArea(s)
 
-            Text(listening ? listeningHint : hintLine)
-                .font(.system(size: 10 * s))
-                .foregroundStyle(
-                    listening
-                        ? .white.opacity(0.34)
-                        : (engine.verdict != nil
-                            ? Color(red: 1.0, green: 0.6, blue: 0.55).opacity(0.85)
-                            : .white.opacity(0.26))
-                )
-                .frame(maxWidth: .infinity)
+            if let coaching = engine.coaching {
+                Text(coaching)
+                    .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 10.5), weight: .medium))
+                    .foregroundStyle(PracticeStyle.Ink.warn)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+            } else if engine.verdict?.isCorrect == false {
+                // 判错反馈必须保留，但只留一句
+                Text("✗ 有几个字母听错了")
+                    .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 10), weight: .medium))
+                    .foregroundStyle(PracticeStyle.Ink.error)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
 
             if !listening {
                 mistakeFootnote(s)
@@ -281,24 +340,69 @@ struct PracticeView: View {
         }
     }
 
+    /// 句子已经全对、但音乐还没唱到句末：给出明确的等待原因和句级进度。
+    /// 只有 LRC 的句首/句末两个锚点，不编造逐词时序。
+    private func allCorrectWaitingBanner(_ s: CGFloat) -> some View {
+        Text(PracticeEngine.allCorrectWaitingText)
+            .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 15), weight: .semibold))
+            .foregroundStyle(PracticeStyle.Ink.mint)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 2 * s)
+    }
+
+    /// 播放异常卡片：只提示和给动作，不自动恢复、不判失败。
+    /// 缺权限时主操作是「打开系统设置」，其余异常主操作是重试/继续播放。
+    private func playbackIssueCard(_ issue: PlaybackIssue, _ s: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 6 * s) {
+            HStack(spacing: 6 * s) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: max(10, 11 * s), weight: .semibold))
+                    .foregroundStyle(PracticeStyle.Ink.warn)
+                Text(issue.title)
+                    .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 13), weight: .semibold))
+                    .foregroundStyle(PracticeStyle.Ink.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+
+            Text(issue.detail)
+                .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 10.5)))
+                .foregroundStyle(PracticeStyle.Ink.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+        }
+        .padding(9 * s)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8 * s, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8 * s, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+
+    private func openAutomationSettings() {
+        guard !preview,
+              let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+        else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     /// 错题本练习时，回看上次错在哪里
     @ViewBuilder
     private func mistakeFootnote(_ s: CGFloat) -> some View {
-        if let warning = mistakes.storageWarning {
-            Text("⚠️ \(warning)")
-                .font(.system(size: 9.5 * s))
-                .foregroundStyle(Color(red: 1.0, green: 0.65, blue: 0.45).opacity(0.9))
-                .lineLimit(2)
-                .minimumScaleFactor(0.7)
-                .frame(maxWidth: .infinity)
-        } else if engine.source == .mistakes,
+        if engine.source == .mistakes,
                   let entry = engine.mistakeEntry(for: engine.current),
                   let last = entry.lastAttempt {
             Text("错题 ×\(entry.attemptCount) · 上次：\(last.inputSummary) · \(shortDate(last.submittedAt))")
-                .font(.system(size: 9.5 * s))
-                .foregroundStyle(.white.opacity(0.3))
+                .font(.system(size: PracticeStyle.caption(s, base: 9.5)))
+                .foregroundStyle(PracticeStyle.Ink.muted)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.8)
                 .frame(maxWidth: .infinity)
         }
     }
@@ -307,10 +411,6 @@ struct PracticeView: View {
         let f = DateFormatter()
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: date)
-    }
-
-    private var listeningHint: String {
-        "唱完会自动暂停 · 已填 \(engine.filledBlankCount)/\(engine.blankWordCount)"
     }
 
     private func revealedStage(_ s: CGFloat) -> some View {
@@ -325,20 +425,18 @@ struct PracticeView: View {
 
                 if let translation = translationText {
                     Text(translation)
-                        .font(.system(size: 15 * s))
-                        .foregroundStyle(.white.opacity(0.6))
+                        .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 15)))
+                        .foregroundStyle(PracticeStyle.Ink.secondary)
                         .multilineTextAlignment(.center)
                         .lineLimit(3)
+                        .minimumScaleFactor(0.7)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity)
                 }
             }
 
             if let word = selectedWord {
                 wordCard(word, s: s)
-            } else {
-                Text("点句子里的词，可以查含义")
-                    .font(.system(size: 10 * s))
-                    .foregroundStyle(.white.opacity(0.22))
             }
 
             if let verdict = engine.verdict, !verdict.isCorrect {
@@ -356,6 +454,8 @@ struct PracticeView: View {
         var raw: String
         var chars: [Character]
         var isBlank: Bool
+        /// 这个空在 `blankIndices` 里的下标（非空为 nil），点击时用来选中
+        var ordinal: Int?
         /// 这个空当前已经输入的字符
         var typed: [Character]
         /// 是否是空格选中的那个空
@@ -379,9 +479,11 @@ struct PracticeView: View {
             let isBlank = blanks.contains(i) && word.isEligible
             var typed: [Character] = []
             var active = false
+            var pieceOrdinal: Int?
             if isBlank {
                 typed = engine.typedChars(forBlank: ordinal)
                 active = ordinal == engine.activeBlank
+                pieceOrdinal = ordinal
                 ordinal += 1
             }
             pieces.append(
@@ -389,6 +491,7 @@ struct PracticeView: View {
                     raw: word.raw,
                     chars: word.chars,
                     isBlank: isBlank,
+                    ordinal: pieceOrdinal,
                     typed: typed,
                     active: active
                 )
@@ -411,8 +514,8 @@ struct PracticeView: View {
         return ZStack {
             if mask.blankCount == 0 {
                 Text("这句没有可输入的字母")
-                    .font(.system(size: 14 * s))
-                    .foregroundStyle(.white.opacity(0.3))
+                    .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 14)))
+                    .foregroundStyle(PracticeStyle.Ink.tertiary)
             } else {
                 CenteredFlow(spacing: 11 * s, lineSpacing: 7 * s) {
                     ForEach(Array(mask.pieces.enumerated()), id: \.offset) { _, piece in
@@ -420,61 +523,56 @@ struct PracticeView: View {
                             slotView(piece, s: s)
                         } else {
                             Text(piece.raw)
-                                .font(.system(size: 20 * s, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.45))
+                                .font(.system(
+                                    size: PracticeStyle.body(s, factor: fontFactor, base: 20),
+                                    design: .rounded
+                                ))
+                                .foregroundStyle(PracticeStyle.Ink.secondary)
                         }
                     }
                 }
                 .frame(maxWidth: .infinity)
             }
 
-            // 真正的输入框：文字与光标都透明，只负责接键盘。
-            // 铺满整个横线区，点任意位置都能直接开始打字。
+            // 隐藏的 AppKit 输入视图：只负责接键盘和输入法。
+            // 直接字母在 AppDelegate 的按键监听里逐字处理；这里保留输入法
+            // 组字提交与粘贴的批量入口。缩成 1×1，文字全部由横线自己画。
             if !preview {
-                TextField("", text: $engine.input)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 20 * s, design: .monospaced))
-                    .foregroundStyle(.clear)
-                    .tint(.clear)
-                    .focused($inputFocused)
-                    .onSubmit {
-                        engine.submit()
-                        clearFieldSelection()
-                    }
-                    // 输入框故意缩成 1×1：文字由上面的横线自己画，输入框只负责接键盘。
-                    // 这样无论回车后系统怎么选中文字，都不会再露出白色选中条。
-                    .frame(width: 1, height: 1)
-                    .opacity(0.01)
-                    .allowsHitTesting(false)
+                PracticeInputSink(
+                    engine: engine,
+                    focusNonce: focusNonce,
+                    onExit: { engine.exitPractice() }
+                )
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+                .allowsHitTesting(false)
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(minHeight: 30 * s)
+        .frame(minHeight: max(28, 30 * s))
         .padding(.horizontal, 12 * s)
         .padding(.vertical, 4 * s)
         .background(shape.fill(fill))
         .overlay(shape.strokeBorder(stroke, lineWidth: 1))
         .contentShape(shape)
-        .onTapGesture { inputFocused = true }
+        .onTapGesture { focusNonce += 1 }
     }
 
-    /// 提交后输入框会被系统全选（透明输入框 => 只剩一条白条，且下次输入会覆盖原内容）。
-    /// 这里把选区收回到末尾，让用户可以接着改。
-    private func clearFieldSelection() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
-            guard let editor = NSApp.keyWindow?.firstResponder as? NSTextView else { return }
-            let end = (editor.string as NSString).length
-            editor.setSelectedRange(NSRange(location: end, length: 0))
-        }
-    }
-
-    /// 当前选中的空加一层浅底，空格切换时一眼能看到跳到哪了
+    /// 当前选中的空加一层浅底，空格/点击切换时一眼能看到跳到哪了
     private func slotView(_ piece: Piece, s: CGFloat) -> some View {
         let shape = RoundedRectangle(cornerRadius: 5 * s, style: .continuous)
         return slotText(piece, s: s)
             .padding(.horizontal, 3 * s)
             .padding(.vertical, 1 * s)
             .background(shape.fill(Color.white.opacity(piece.active ? 0.09 : 0)))
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if let ordinal = piece.ordinal {
+                    engine.selectBlank(ordinal)
+                    focusNonce += 1
+                }
+            }
+            .help(piece.active ? "当前要填的空" : "点击回到这个空（可修改前面的答案）")
     }
 
     /// 一个空：已输入的字母逐字着色，未输入的画下划线
@@ -503,7 +601,10 @@ struct PracticeView: View {
             output = output + Text(String(piece.typed[piece.chars.count...]))
                 .foregroundColor(Color(red: 1.0, green: 0.45, blue: 0.45))
         }
-        return output.font(.system(size: 20 * s, design: .monospaced))
+        return output.font(.system(
+            size: PracticeStyle.body(s, factor: fontFactor, base: 20),
+            design: .monospaced
+        ))
     }
 
     // MARK: 点词查义
@@ -531,8 +632,12 @@ struct PracticeView: View {
             }
         } label: {
             Text(raw)
-                .font(.system(size: 21 * s, weight: .semibold, design: .rounded))
-                .foregroundStyle(selected ? Color.white : .white.opacity(0.9))
+                .font(.system(
+                    size: PracticeStyle.body(s, factor: fontFactor, base: 21),
+                    weight: .semibold,
+                    design: .rounded
+                ))
+                .foregroundStyle(selected ? Color.white : PracticeStyle.Ink.primary)
                 .padding(.horizontal, 4 * s)
                 .padding(.vertical, 1.5 * s)
                 .background(
@@ -541,23 +646,28 @@ struct PracticeView: View {
                 )
         }
         .buttonStyle(.plain)
+        .help("点词查看含义")
     }
 
     private func wordCard(_ word: String, s: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 3 * s) {
             Text(word)
-                .font(.system(size: 15 * s, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white.opacity(0.9))
+                .font(.system(
+                    size: PracticeStyle.body(s, factor: fontFactor, base: 15),
+                    weight: .semibold,
+                    design: .rounded
+                ))
+                .foregroundStyle(PracticeStyle.Ink.primary)
 
             if let meaning = translator.translation(for: word), !meaning.isEmpty {
                 Text(meaning)
-                    .font(.system(size: 14 * s))
-                    .foregroundStyle(.white.opacity(0.72))
+                    .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 14)))
+                    .foregroundStyle(PracticeStyle.Ink.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("查询中…")
-                    .font(.system(size: 12 * s))
-                    .foregroundStyle(.white.opacity(0.32))
+                    .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 12)))
+                    .foregroundStyle(PracticeStyle.Ink.tertiary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -592,9 +702,9 @@ struct PracticeView: View {
 
     private func label(_ text: String, _ s: CGFloat) -> some View {
         Text(text)
-            .font(.system(size: 10 * s))
-            .foregroundStyle(.white.opacity(0.3))
-            .frame(width: 26 * s, alignment: .leading)
+            .font(.system(size: PracticeStyle.caption(s, base: 10)))
+            .foregroundStyle(PracticeStyle.Ink.tertiary)
+            .frame(width: 26 * s * fontFactor, alignment: .leading)
             .padding(.top, 3 * s)
     }
 
@@ -631,43 +741,89 @@ struct PracticeView: View {
             output = output + Text(word).foregroundColor(color)
             first = false
         }
-        return output.font(.system(size: 13 * s, design: .rounded))
+        return output.font(.system(
+            size: PracticeStyle.body(s, factor: fontFactor, base: 13),
+            design: .rounded
+        ))
     }
 
     // MARK: 底部动作
 
+    /// 播放异常时的恢复动作：固定在底部（数字按钮上方），不随卡片滚出屏幕。
+    /// 恢复入口只出现这一处，卡片里不再重复。
     @ViewBuilder
-    private func actions(_ s: CGFloat) -> some View {
-        HStack(spacing: 8 * s) {
-            switch engine.phase {
-            case .asking:
-                if engine.isSongMode {
-                    capsule("重听 ⌘R", s, emphasized: true, key: "r") { engine.replay() }
+    private func issueActions(_ s: CGFloat) -> some View {
+        if let issue = engine.playbackNotice {
+            WrapRowLayout(spacing: 6 * s, lineSpacing: 5 * s) {
+                switch issue.primaryAction {
+                case .openSettings:
+                    capsule("打开系统设置", s, emphasized: true) { openAutomationSettings() }
+                case .retry:
+                    capsule(issue.retryActionLabel, s, emphasized: true) { engine.resumePlayback() }
                 }
-                capsule("看答案 ⌘E", s, key: "e") { engine.giveUp() }
-                capsule("跳过 ⌘.", s, key: ".") { engine.skip() }
-            case .listening:
-                capsule("重听 ⌘R", s, emphasized: true, key: "r") { engine.replay() }
-                capsule("跳过 ⌘.", s, key: ".") { engine.skip() }
-            case .revealed:
-                capsule("再试试 ⌘T", s, key: "t") { engine.retryAfterReveal() }
-                capsule("下一句 ⏎", s, emphasized: true, key: .return, modifiers: []) { engine.next() }
-            case .idle:
-                if engine.stats.correct + engine.stats.wrong > 0 {
-                    capsule("再来一遍 ⏎", s, emphasized: true, key: .return, modifiers: []) {
-                        engine.restartSession()
+                if issue.offersSecondaryRetry {
+                    capsule(issue.retryActionLabel, s) { engine.resumePlayback() }
+                }
+                if issue.suggestsStopping {
+                    capsule("结束练习", s) { engine.stopSession() }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.trailing, 8)
+        }
+    }
+
+    /// 固定底部操作区。按钮与数字键 1…6 共用 engine 的动作判定：
+    /// 主操作先换行，导航固定在右侧；内容再长也推不走它们。
+    private func actions(_ s: CGFloat) -> some View {
+        HStack(alignment: .top, spacing: 8 * s) {
+            WrapRowLayout(spacing: 8 * s, lineSpacing: 6 * s) {
+                ForEach(PracticeCommand.primaryRow, id: \.self) { command in
+                    if let title = engine.commandTitle(command) {
+                        let shortcut = legacyShortcut(command)
+                        capsule(
+                            title,
+                            s,
+                            emphasized: command == .primary,
+                            key: shortcut?.key,
+                            modifiers: shortcut?.modifiers ?? .command
+                        ) {
+                            engine.perform(command)
+                        }
                     }
                 }
-                capsule("重新选择", s, emphasized: engine.stats.correct + engine.stats.wrong == 0) {
-                    engine.returnToSetup()
-                }
-            case .setup:
-                EmptyView()
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Spacer(minLength: 0)
+            HStack(spacing: 6 * s) {
+                ForEach(PracticeCommand.secondaryRow, id: \.self) { command in
+                    if let title = engine.commandTitle(command) {
+                        capsule(title, s) { engine.perform(command) }
+                    }
+                }
+            }
+        }
+        // 右下角缩放手柄不吃按钮：给固定操作区留出尾部空间
+        .padding(.trailing, 8)
+    }
 
-            capsule("退出 ⎋", s) { settings.practiceMode = false }
+    /// 旧快捷键继续兼容，但界面只显示数字
+    private func legacyShortcut(
+        _ command: PracticeCommand
+    ) -> (key: KeyEquivalent, modifiers: EventModifiers)? {
+        switch command {
+        case .primary:
+            return (.return, [])
+        case .replayOrRead:
+            return engine.isSongMode ? ("r", .command) : nil
+        case .revealOrRetry:
+            if engine.phase == .asking { return ("e", .command) }
+            if engine.phase == .revealed { return ("t", .command) }
+            return nil
+        case .skip:
+            return (".", .command)
+        case .backToSetup, .exitPractice:
+            return nil
         }
     }
 
@@ -681,13 +837,14 @@ struct PracticeView: View {
     ) -> some View {
         let button = Button(action: action) {
             Text(title)
-                .font(.system(size: 11.5 * s, weight: .medium))
-                .padding(.horizontal, 12 * s)
-                .padding(.vertical, 6 * s)
+                .font(.system(size: PracticeStyle.control(s), weight: .medium))
+                .lineLimit(1)
+                .padding(.horizontal, max(9, 12 * s))
+                .padding(.vertical, max(5, 6 * s))
                 .background(
-                    Capsule().fill(Color.white.opacity(emphasized ? 0.2 : 0.1))
+                    Capsule().fill(Color.white.opacity(emphasized ? 0.20 : 0.10))
                 )
-                .foregroundStyle(.white.opacity(emphasized ? 0.95 : 0.75))
+                .foregroundStyle(emphasized ? PracticeStyle.Ink.primary : PracticeStyle.Ink.secondary)
         }
         .buttonStyle(.plain)
 
@@ -700,32 +857,31 @@ struct PracticeView: View {
         }
     }
 
-    // MARK: 收藏
-
+    /// 答题阶段提交只走回车：固定区只留一句低调提示，不再放重复的提交按钮。
+    /// 收听中/无题时不显示；字号沿用现有提示文字的可读标准。
     @ViewBuilder
-    private func favoriteButton(_ s: CGFloat) -> some View {
-        if let question = engine.current {
-            let added = bank.contains(text: question.text, title: question.title)
-            Button {
-                bank.toggle(
-                    text: question.text,
-                    translation: engine.translation(for: question),
-                    title: question.title,
-                    artist: question.artist,
-                    lineTime: question.lineTime ?? 0
-                )
-            } label: {
-                Image(systemName: added ? "bookmark.fill" : "bookmark")
-                    .font(.system(size: 11 * s, weight: .semibold))
-                    .foregroundStyle(added
-                        ? Color(red: 0.41, green: 0.83, blue: 0.57)
-                        : .white.opacity(0.45))
-                    .frame(width: 21 * s, height: 21 * s)
-                    .background(Circle().fill(Color.white.opacity(added ? 0.1 : 0.05)))
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help(added ? "已收藏，点击取消" : "收藏这句歌词")
+    private func returnHint(_ s: CGFloat) -> some View {
+        if engine.showsReturnHint {
+            Text("回车继续")
+                // 操作区是窗口 chrome：跟随窗口缩放、不随字号 72 放大，保持低调
+                .font(.system(size: PracticeStyle.hint(s, base: 10)))
+                .foregroundStyle(PracticeStyle.Ink.tertiary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 2)
+        }
+    }
+
+    /// 没有英语音色时给一句短提示；下一题/重试会自动清掉
+    @ViewBuilder
+    private func speechNotice(_ s: CGFloat) -> some View {
+        if let notice = engine.speechNotice {
+            Text(notice)
+                .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 10)))
+                .foregroundStyle(PracticeStyle.Ink.warn)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .frame(maxWidth: .infinity, alignment: .center)
         }
     }
 
@@ -742,26 +898,6 @@ struct PracticeView: View {
         guard let text = engine.translation(for: engine.revealed), !text.isEmpty else { return nil }
         return text
     }
-
-    private var hintLine: String {
-        if engine.verdict?.isCorrect == false {
-            return engine.isSongMode
-                ? "✗ 有几个字母听错了 · 改一改，或按 ⌘R 重听"
-                : "✗ 有几个字母听错了 · 改一改再提交"
-        }
-        if engine.input.contains(where: { !$0.isASCII && !$0.isWhitespace }) {
-            return "⌘Space 切换到英文输入法"
-        }
-        var parts: [String] = []
-        if engine.isRetry { parts.append("重试 · 不计分") }
-        parts.append("空格切换横线")
-        parts.append("已填 \(engine.filledBlankCount)/\(engine.blankWordCount)")
-        parts.append("⏎ 提交")
-        if engine.isSongMode { parts.append("⌘R 重听") }
-        if !engine.isSongMode { parts.append("无音频 · 不可重听") }
-        parts.append("⎋ 退出")
-        return parts.joined(separator: " · ")
-    }
 }
 
 /// 居中换行布局：逐词点击 / 逐空输入都需要每行各自居中
@@ -769,13 +905,23 @@ struct CenteredFlow: Layout {
     var spacing: CGFloat = 6
     var lineSpacing: CGFloat = 4
 
+    /// 单个词在窄窗 + 大字号下可能比整行还宽：先按行宽重新测量，
+    /// 让 Text 自己折行，而不是让整块内容横向溢出/被裁切。
+    private func measured(_ subview: LayoutSubview, maxWidth: CGFloat) -> CGSize {
+        let ideal = subview.sizeThatFits(.unspecified)
+        guard maxWidth > 1, ideal.width > maxWidth else { return ideal }
+        var size = subview.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+        size.width = min(size.width, maxWidth)
+        return size
+    }
+
     private func lines(_ subviews: LayoutSubviews, maxWidth: CGFloat) -> [[CGSize]] {
         var result: [[CGSize]] = []
         var current: [CGSize] = []
         var width: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
+            let size = measured(subview, maxWidth: maxWidth)
             let needed = current.isEmpty ? size.width : width + spacing + size.width
             if needed > maxWidth, !current.isEmpty {
                 result.append(current)

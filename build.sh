@@ -20,7 +20,8 @@ swiftc -O -swift-version 5 \
     -framework SwiftUI \
     -framework Translation \
     -framework NaturalLanguage \
-    -framework CryptoKit
+    -framework CryptoKit \
+    -framework AVFoundation
 
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 

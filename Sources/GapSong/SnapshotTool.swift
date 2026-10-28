@@ -13,16 +13,43 @@ enum SnapshotTool {
         setup: Bool = false,
         bankPractice: Bool = false,
         retry: Bool = false,
+        waiting: Bool = false,
         library: LibraryTab? = nil,
-        mistakePractice: Bool = false
+        mistakePractice: Bool = false,
+        issue: PlaybackIssue? = nil,
+        storageWarning: Bool = false,
+        libraryConfirmDelete: Bool = false
     ) -> Never {
         setvbuf(stdout, nil, _IONBF, 0)
         let settings = Settings()
+        // 可选 --snapshot-font 72：同一套快照覆盖 14–72 的字号排版
+        if let raw = SnapshotTool.argumentValue("--snapshot-font"),
+           let fontSize = Double(raw) {
+            settings.fontSize = min(max(fontSize, 14), 72)
+        }
         let state = PlayerState()
-        // 快照用独立题库，别把用户真实的收藏读进来
-        let bankURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("gapsong-snapshot-\(UUID().uuidString).json")
+        // 快照用独立题库，别把用户真实的收藏读进来。
+        // storageWarning 变体故意指向一个只读目录，让写入真的失败（不伪造提示文案）。
+        let bankURL: URL
+        if storageWarning {
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("gapsong-snapshot-readonly-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+            bankURL = dir.appendingPathComponent("questions.json")
+        } else {
+            bankURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("gapsong-snapshot-\(UUID().uuidString).json")
+        }
         let bank = QuestionBank(url: bankURL)
+        if storageWarning {
+            // 真正触发一次写失败，界面上的警示必须来自真实错误
+            _ = bank.add(
+                text: DemoFixtures.firstLine, translation: DemoFixtures.firstTranslation,
+                title: DemoFixtures.paperLanterns.track.title,
+                artist: DemoFixtures.paperLanterns.track.artist, lineTime: 12
+            )
+        }
         let mistakeURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("gapsong-snapshot-mistakes-\(UUID().uuidString).json")
         let mistakes = MistakeBook(url: mistakeURL)
@@ -33,10 +60,13 @@ enum SnapshotTool {
             bank: bank,
             mistakes: mistakes
         )
+        // 快照绝不发真实语音：显式保持静默朗读器（数字 1 的标签仍可核对）
+        engine.installSpeechSpeaker(SilentSpeechSpeaker())
 
         if let library {
             renderLibrary(bank: bank, mistakes: mistakes, tab: library,
-                          path: path, width: width, height: height)
+                          path: path, width: width, height: height,
+                          confirmDelete: libraryConfirmDelete)
         } else if mistakePractice {
             renderMistakePractice(state: state, settings: settings, engine: engine,
                                   bank: bank, mistakes: mistakes,
@@ -50,11 +80,18 @@ enum SnapshotTool {
         } else if practice {
             renderPractice(state: state, engine: engine, settings: settings, bank: bank,
                            mistakes: mistakes, path: path, width: width, height: height,
-                           answer: answer, retry: retry)
+                           answer: answer, retry: retry, waiting: waiting, issue: issue)
         } else {
             renderLyrics(state: state, settings: settings, engine: engine, bank: bank,
                          mistakes: mistakes, path: path, width: width, height: height, full: full)
         }
+    }
+
+    /// 读取 `--flag value` 形式的参数（仅快照进程使用）
+    private static func argumentValue(_ flag: String) -> String? {
+        let args = CommandLine.arguments
+        guard let index = args.firstIndex(of: flag), args.count > index + 1 else { return nil }
+        return args[index + 1]
     }
 
     // MARK: 歌词窗
@@ -111,13 +148,16 @@ enum SnapshotTool {
         width: CGFloat,
         height: CGFloat,
         answer: Bool,
-        retry: Bool
+        retry: Bool,
+        waiting: Bool,
+        issue: PlaybackIssue?
     ) -> Never {
         let song = DemoFixtures.paperLanterns
         state.debugInject(
             track: song.track,
-            position: 12.4,
-            playing: false,
+            // 等句末的预览要让「本句进度」有真实的中间位置；普通答题仍是暂停态
+            position: waiting ? 15.4 : 12.4,
+            playing: waiting,
             lines: song.lines,
             translations: song.translations
         )
@@ -138,16 +178,21 @@ enum SnapshotTool {
             actual: "I kept the lanterns burning law"
         )
         engine.debugShow(
-            phase: answer ? .revealed : .asking,
+            // 播放异常时停在收听态：输入已保留，等用户选择重试/结束/跳过
+            phase: waiting ? .listening : (issue == nil ? (answer ? .revealed : .asking) : .listening),
             // 答题态模拟「打到一半」：前面正确、一个字母错、后面还没打
-            input: answer ? "I kept the lanterns burning law" : "I kept the lanterns buring",
+            input: waiting
+                ? DemoFixtures.firstLine
+                : (answer ? "I kept the lanterns burning law" : "I kept the lanterns buring"),
             verdict: answer ? verdict : nil,
             current: question,
             revealed: answer ? question : nil,
             progress: "1 / 8",
             score: 128,
             streak: answer ? 0 : 3,
-            retry: retry
+            retry: retry,
+            playbackIssue: issue,
+            waitingForLineEnd: waiting
         )
 
         let view = OverlayView(
@@ -163,7 +208,7 @@ enum SnapshotTool {
         .environment(\.practicePreview, true)
         .frame(width: width, height: height)
 
-        write(view, to: path)
+        writeHosted(view, width: width, height: height, to: path)
     }
 
     // MARK: 题库练习
@@ -226,7 +271,7 @@ enum SnapshotTool {
         .environment(\.practicePreview, true)
         .frame(width: width, height: height)
 
-        write(view, to: path)
+        writeHosted(view, width: width, height: height, to: path)
     }
 
     // MARK: 练习设置
@@ -297,7 +342,7 @@ enum SnapshotTool {
         .environment(\.practicePreview, true)
         .frame(width: width, height: height)
 
-        write(view, to: path)
+        writeHosted(view, width: width, height: height, to: path)
     }
 
     // MARK: 收藏/错题管理
@@ -309,7 +354,8 @@ enum SnapshotTool {
         tab: LibraryTab,
         path: String,
         width: CGFloat,
-        height: CGFloat
+        height: CGFloat,
+        confirmDelete: Bool = false
     ) -> Never {
         let song = DemoFixtures.paperLanterns
         bank.add(text: DemoFixtures.firstLine, translation: DemoFixtures.firstTranslation,
@@ -344,10 +390,21 @@ enum SnapshotTool {
             raw: "The river carried names we never sayed"
         ))
 
+        let model = LibraryModel(tab: tab)
+        if confirmDelete {
+            // 只在快照里把某一行的删除确认框展开，不写任何文件
+            switch tab {
+            case .favorites:
+                if let id = bank.items.first?.id { model.pendingDelete = .favorite(id) }
+            case .mistakes:
+                if let id = mistakes.entries.first?.id { model.pendingDelete = .mistake(id) }
+            }
+        }
+
         let view = LibraryView(
             favorites: bank,
             mistakes: mistakes,
-            model: LibraryModel(tab: tab),
+            model: model,
             preview: true,
             onPracticeFavorite: { _ in },
             onPracticeAllFavorites: {},
@@ -443,17 +500,34 @@ enum SnapshotTool {
         .environment(\.practicePreview, true)
         .frame(width: width, height: height)
 
-        write(view, to: path)
+        writeHosted(view, width: width, height: height, to: path)
     }
 
     // MARK: 输出
 
+    /// 普通快照：ImageRenderer 足够，且能正确画纯 SwiftUI 内容。
     @MainActor
     private static func write(_ view: some View, to path: String) -> Never {
-        let renderer = ImageRenderer(content: view)
-        renderer.scale = 2
+        finish(renderWithImageRenderer(view), path: path)
+    }
 
-        guard let image = renderer.nsImage,
+    /// 听写/设置这类界面内部有 ScrollView。当前的 SwiftUI `ImageRenderer`
+    /// 不会给 ScrollView 做栅格化（输出整片纯背景），所以这里改用
+    /// NSHostingView + cacheDisplay 走 AppKit 的原生位图缓存：
+    /// 同一个 SwiftUI 视图、同一套布局，只是换了光栅化路径，生产 UI 不受影响。
+    @MainActor
+    private static func writeHosted(
+        _ view: some View,
+        width: CGFloat,
+        height: CGFloat,
+        to path: String
+    ) -> Never {
+        finish(renderWithHostingView(view, width: width, height: height), path: path)
+    }
+
+    @MainActor
+    private static func finish(_ image: NSImage?, path: String) -> Never {
+        guard let image,
               let tiff = image.tiffRepresentation,
               let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:]) else {
@@ -463,5 +537,57 @@ enum SnapshotTool {
         try? png.write(to: URL(fileURLWithPath: path))
         print("saved \(path) size=\(image.size)")
         exit(0)
+    }
+
+    @MainActor
+    private static func renderWithImageRenderer(_ view: some View) -> NSImage? {
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        return renderer.nsImage
+    }
+
+    @MainActor
+    private static func renderWithHostingView(
+        _ view: some View,
+        width: CGFloat,
+        height: CGFloat
+    ) -> NSImage? {
+        let scale: CGFloat = 2
+        let frame = NSRect(x: 0, y: 0, width: width, height: height)
+        let host = NSHostingView(rootView: view.frame(width: width, height: height))
+        host.frame = frame
+
+        // 放进一个不显示的 borderless 窗口：有真实窗口层级才能拿到正确的
+        // 原生位图缓存（ScrollView 也才会真正排版并绘制内容）。
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.setIsVisible(false)
+        host.layoutSubtreeIfNeeded()
+
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(width * scale),
+            pixelsHigh: Int(height * scale),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        rep.size = NSSize(width: width, height: height)
+
+        host.cacheDisplay(in: host.bounds, to: rep)
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.addRepresentation(rep)
+        _ = window
+        return image
     }
 }

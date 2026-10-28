@@ -21,7 +21,7 @@ body:
     attributes:
       label: GapSong 版本
       description: Release tag，或 `defaults read com.gapsong.app` 里的版本
-      placeholder: "0.4.0"
+      placeholder: "0.5.0"
     validations:
       required: true
 

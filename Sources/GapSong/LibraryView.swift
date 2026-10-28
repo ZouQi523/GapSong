@@ -15,12 +15,63 @@ enum LibraryTab: String, CaseIterable, Identifiable {
     }
 }
 
+/// 单条删除的目标：收藏或错题
+enum LibraryDeleteTarget: Equatable {
+    case favorite(UUID)
+    case mistake(UUID)
+}
+
 @MainActor
 final class LibraryModel: ObservableObject {
     @Published var tab: LibraryTab
+    /// 正在等待确认的单条删除；nil = 没有待确认的删除
+    @Published var pendingDelete: LibraryDeleteTarget?
+    /// 删除结果 / 写入失败的提示
+    @Published var notice: String?
+    /// 删除确认：默认拒绝（离屏预览里绝不落盘），真实窗口由 AppDelegate 注入系统确认框
+    var confirmDelete: (String, String) -> Bool = { _, _ in false }
 
-    init(tab: LibraryTab = .favorites) {
+    init(tab: LibraryTab = .favorites, confirmDelete: ((String, String) -> Bool)? = nil) {
         self.tab = tab
+        if let confirmDelete { self.confirmDelete = confirmDelete }
+    }
+
+    func askDelete(_ target: LibraryDeleteTarget) {
+        pendingDelete = target
+    }
+
+    /// 取消删除：只清掉待确认状态，绝不触碰磁盘
+    func cancelDelete() {
+        pendingDelete = nil
+    }
+
+    /// 只有确认删除后才调用底层 remove，并且把写失败如实报出来
+    @discardableResult
+    func confirmPendingDelete(favorites: QuestionBank, mistakes: MistakeBook) -> Bool {
+        guard let target = pendingDelete else { return false }
+        pendingDelete = nil
+        switch target {
+        case .favorite(let id):
+            guard confirmDelete("删除这句收藏？", "将从收藏里移除这一句，之后可以重新收藏。") else { return false }
+            guard favorites.remove(id: id) else {
+                notice = favorites.storageWarning ?? "删除失败"
+                return false
+            }
+            notice = nil
+            return true
+        case .mistake(let id):
+            let attempts = mistakes.entries.first(where: { $0.id == id })?.attemptCount ?? 0
+            guard confirmDelete(
+                "删除这条错题？",
+                "将删除这一句以及它的 \(attempts) 次错误历史。此操作不可撤销。"
+            ) else { return false }
+            guard mistakes.remove(id: id) else {
+                notice = mistakes.saveError ?? "删除失败"
+                return false
+            }
+            notice = nil
+            return true
+        }
     }
 }
 
@@ -49,17 +100,33 @@ struct LibraryView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
-            if let warning = mistakes.storageWarning {
-                Text("⚠️ \(warning)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Color(red: 1.0, green: 0.65, blue: 0.45))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Color.orange.opacity(0.08))
-                    )
+            if let warning = favorites.storageWarning ?? mistakes.storageWarning {
+                StorageWarningBanner(text: warning)
+            }
+            if let notice = model.notice {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle.fill")
+                        .font(.system(size: 10))
+                    Text(notice)
+                        .font(.system(size: 10))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button {
+                        model.notice = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                    .help("知道了")
+                }
+                .foregroundStyle(.white.opacity(0.7))
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
             }
             tabs
             Divider().overlay(Color.white.opacity(0.08))
@@ -166,7 +233,7 @@ struct LibraryView: View {
             if favorites.isEmpty {
                 emptyState(
                     icon: "bookmark",
-                    text: "还没有收藏。播放时点歌词右侧的书签，或在练习中点右上角的书签。"
+                    text: "还没有收藏。全文模式点歌词右侧书签。"
                 )
             } else {
                 rows {
@@ -194,7 +261,7 @@ struct LibraryView: View {
             if mistakes.isEmpty {
                 emptyState(
                     icon: "exclamationmark.bubble",
-                    text: "还没有错题。只有真正提交且判错才会记录；跳过、空提交、看答案都不会记。"
+                    text: "还没有错题。提交错误答案后自动记录。"
                 )
             } else {
                 rows {
@@ -204,8 +271,13 @@ struct LibraryView: View {
                             preview: preview,
                             mint: mint,
                             red: red,
+                            confirmingDelete: model.pendingDelete == .mistake(entry.id),
                             onPractice: { onPracticeMistake(entry.id) },
-                            onDelete: { mistakes.remove(id: entry.id) }
+                            onAskDelete: { model.askDelete(.mistake(entry.id)) },
+                            onConfirmDelete: {
+                                model.confirmPendingDelete(favorites: favorites, mistakes: mistakes)
+                            },
+                            onCancelDelete: { model.cancelDelete() }
                         )
                     }
                 }
@@ -318,9 +390,17 @@ struct LibraryView: View {
 
             Spacer(minLength: 8)
 
-            HStack(spacing: 6) {
-                rowButton("练这句") { onPracticeFavorite(item.id) }
-                trashButton { favorites.remove(id: item.id) }
+            if model.pendingDelete == .favorite(item.id) {
+                deleteConfirmRow {
+                    model.confirmPendingDelete(favorites: favorites, mistakes: mistakes)
+                } onCancel: {
+                    model.cancelDelete()
+                }
+            } else {
+                HStack(spacing: 6) {
+                    rowButton("练这句") { onPracticeFavorite(item.id) }
+                    trashButton { model.askDelete(.favorite(item.id)) }
+                }
             }
         }
         .padding(10)
@@ -351,16 +431,48 @@ struct LibraryView: View {
                 .background(Circle().fill(Color.white.opacity(0.04)))
         }
         .buttonStyle(.plain)
-        .help("删除")
+        .help("删除（会先确认）")
+    }
+
+    /// 单条删除的二次确认：点「取消」不落盘，点「删除」才真正写文件
+    private func deleteConfirmRow(
+        onConfirm: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 6) {
+            Text("删除？")
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.6))
+            Button(action: onConfirm) {
+                Text("删除")
+                    .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(red.opacity(0.22)))
+                    .foregroundStyle(red.opacity(0.95))
+            }
+            .buttonStyle(.plain)
+            Button(action: onCancel) {
+                Text("取消")
+                    .font(.system(size: 10, weight: .medium))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.escape, modifiers: [])
+        }
     }
 
     // MARK: 底部
 
     private var footer: some View {
-        Text("收藏在播放时点歌词右侧书签，或在练习中点右上角书签；错题只在真正提交且判错时记录，历史不会自动删除。所有数据只保存在本机。")
-            .font(.system(size: 9.5))
-            .foregroundStyle(.white.opacity(0.28))
-            .lineLimit(2)
+        Text("数据只保存在本机")
+            .font(.system(size: 10))
+            .foregroundStyle(.white.opacity(0.6))
+            .lineLimit(1)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -370,8 +482,12 @@ private struct MistakeRow: View {
     let preview: Bool
     let mint: Color
     let red: Color
+    /// 这一条是否正在等待删除确认
+    var confirmingDelete: Bool = false
     let onPractice: () -> Void
-    let onDelete: () -> Void
+    let onAskDelete: () -> Void
+    let onConfirmDelete: () -> Void
+    let onCancelDelete: () -> Void
 
     @State private var expanded: Bool
 
@@ -380,15 +496,21 @@ private struct MistakeRow: View {
         preview: Bool,
         mint: Color,
         red: Color,
+        confirmingDelete: Bool = false,
         onPractice: @escaping () -> Void,
-        onDelete: @escaping () -> Void
+        onAskDelete: @escaping () -> Void,
+        onConfirmDelete: @escaping () -> Void,
+        onCancelDelete: @escaping () -> Void
     ) {
         self.entry = entry
         self.preview = preview
         self.mint = mint
         self.red = red
+        self.confirmingDelete = confirmingDelete
         self.onPractice = onPractice
-        self.onDelete = onDelete
+        self.onAskDelete = onAskDelete
+        self.onConfirmDelete = onConfirmDelete
+        self.onCancelDelete = onCancelDelete
         _expanded = State(initialValue: preview)
     }
 
@@ -441,15 +563,40 @@ private struct MistakeRow: View {
                     }
                     .buttonStyle(.plain)
 
-                    Button(action: onDelete) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.35))
-                            .frame(width: 24, height: 22)
-                            .background(Circle().fill(Color.white.opacity(0.04)))
+                    if confirmingDelete {
+                        Text("删除？")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.6))
+                        Button(action: onConfirmDelete) {
+                            Text("删除")
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(red.opacity(0.22)))
+                                .foregroundStyle(red.opacity(0.95))
+                        }
+                        .buttonStyle(.plain)
+                        Button(action: onCancelDelete) {
+                            Text("取消")
+                                .font(.system(size: 10, weight: .medium))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(Color.white.opacity(0.08)))
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut(.escape, modifiers: [])
+                    } else {
+                        Button(action: onAskDelete) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.35))
+                                .frame(width: 24, height: 22)
+                                .background(Circle().fill(Color.white.opacity(0.04)))
+                        }
+                        .buttonStyle(.plain)
+                        .help("删除这条错题（会先确认）")
                     }
-                    .buttonStyle(.plain)
-                    .help("删除这条错题")
                 }
             }
 
@@ -533,9 +680,10 @@ final class LibraryWindowController: NSWindowController {
         onPracticeMistake: @escaping (UUID) -> Void,
         onPracticeAllMistakes: @escaping () -> Void,
         onClearFavorites: @escaping () -> Void,
-        onClearMistakes: @escaping () -> Void
+        onClearMistakes: @escaping () -> Void,
+        confirmDelete: @escaping (String, String) -> Bool
     ) {
-        let model = LibraryModel(tab: initialTab)
+        let model = LibraryModel(tab: initialTab, confirmDelete: confirmDelete)
         self.model = model
 
         let window = NSWindow(

@@ -14,22 +14,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var overlay: OverlayController!
     private var statusItem: NSStatusItem!
     private var cancellables: Set<AnyCancellable> = []
-    private var sizeBeforePractice: (Double, Double)?
+    private var sizeBeforePractice: (width: Double, height: Double)?
     private var contextMenuMonitor: Any?
     private var practiceKeyMonitor: Any?
+    /// 字号快捷键：菜单项与本地 keyDown 监视器共用
+    private var fontShortcuts: FontShortcutMonitor?
+    /// 只在输入源变化时写一条诊断，避免每个字母刷日志
+    private var lastLoggedInputSource: String?
     private var libraryWindow: LibraryWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let demo = CommandLine.arguments.contains("--demo") || UserDefaults.standard.bool(forKey: "demoMode")
+        // 偏好一律走注入的 suite：隔离启动绝不读真实偏好的 demoMode
+        let demo = CommandLine.arguments.contains("--demo") || settings.store.bool(forKey: "demoMode")
+        // 隔离/演示运行不启动真实播放链路：不轮询 Music，也不触发自动化授权
+        let controlMusic = !demo && !AppRuntime.isIsolated
         practice = PracticeEngine(
             state: state,
-            watcher: demo ? NoopMusicController() : watcher,
+            watcher: controlMusic ? watcher : NoopMusicController(),
             settings: settings,
             bank: bank,
             mistakes: mistakes
         )
+        // 隔离/快照/自检绝不真的发声；正常运行时用本地合成的键击音
+        practice.typingSoundPlayer = AppRuntime.isIsolated
+            ? SilentTypingSoundPlayer()
+            : TypewriterSoundPlayer()
+        // 英语朗读同理：隔离运行保持静默，正常 App 才接 Apple 原生 TTS
+        if !AppRuntime.isIsolated {
+            practice.installSpeechSpeaker(AppleSpeechSpeaker())
+        }
         overlay = OverlayController(
             state: state,
             settings: settings,
@@ -38,6 +53,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mistakes: mistakes
         )
         installContextMenu()
+        // 状态栏/右键菜单不是 mainMenu，菜单关闭时 ⌘= / ⌘- 不会被 AppKit 自动路由，
+        // 所以在本地 keyDown 监视器里显式接住，只处理 GapSong 自己的窗口。
+        let fontShortcuts = FontShortcutMonitor(settings: settings) { window in
+            NSApp.windows.contains { $0 === window }
+        }
+        fontShortcuts.install()
+        self.fontShortcuts = fontShortcuts
         installPracticeKeyMonitor()
         practice.onRequestFocus = { [weak self] in
             self?.overlay.focusForKeyInput()
@@ -51,12 +73,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watcher.onProblem = { [weak self] msg in
             self?.state.setHint(msg)
         }
-        if !demo { watcher.start() }
+        watcher.onProblemKind = { [weak self] problem in
+            self?.state.setHint(problem.message)
+            self?.practice.reportMusicProblem(problem)
+        }
+        // 采样恢复正常后清掉过期的授权/控制提示（练习里的异常仍由用户显式处理）
+        watcher.onRecovered = { [weak self] in
+            self?.state.clearHint()
+        }
+        if controlMusic { watcher.start() }
 
-        state.translator.onNeedsDownload = { [weak self] in
-            guard let self else { return }
-            self.overlay.show()
-            NSApp.activate(ignoringOtherApps: true)
+        // 演示/隔离运行不要去触发系统语言包下载弹窗
+        if controlMusic {
+            state.translator.onNeedsDownload = { [weak self] in
+                guard let self else { return }
+                self.overlay.show()
+                NSApp.activate(ignoringOtherApps: true)
+            }
         }
 
         buildStatusItem()
@@ -110,6 +143,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self?.practice.debugForceAsking()
                 }
             }
+
+            // 验收用：只在隔离数据目录里预置演示收藏与错题，绝不写真实数据
+            if CommandLine.arguments.contains("--demo-seed") {
+                if AppRuntime.isIsolated {
+                    seedDemoLibrary()
+                } else {
+                    Diag.log("demo-seed refused: 需要 GAPSONG_ISOLATED=1")
+                    print("⚠️ --demo-seed 只在隔离运行（GAPSONG_ISOLATED=1）下写入，已跳过")
+                }
+            }
+
+            // 验收用：模拟练习中的播放异常（不发任何真实播放命令）
+            if CommandLine.arguments.contains("--practice-playback-error") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                    self?.practice.reportMusicProblem(.unauthorized)
+                }
+            }
+
+            // 验收用：直接打开收藏/错题管理窗口
+            if CommandLine.arguments.contains("--demo-library") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    self?.showLibrary(tab: .favorites)
+                }
+            }
         }
 
         settings.$targetLanguageID
@@ -136,18 +193,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .store(in: &cancellables)
     }
 
-    /// 听写需要更大的窗口；退出时恢复原来的尺寸
+    /// 听写需要更大的窗口；退出时恢复「歌词态」记住的尺寸（跨重启也生效）。
+    ///
+    /// 关键：练习态写回的 panelWidth/Height 不覆盖 lyricPanel*，所以
+    /// 「启动时 practiceMode 已经是 true」也能在退出练习后回到原来的紧凑尺寸。
     private func applyPracticeLayout(_ on: Bool) {
         if on {
-            if settings.panelHeight < 320 {
-                sizeBeforePractice = (settings.panelWidth, settings.panelHeight)
-                settings.setSize(width: max(720, settings.panelWidth), height: 400)
+            // 先记下进入练习前的歌词态尺寸，再放大窗口（顺序不能反）
+            settings.captureLyricSizeIfNeeded()
+            sizeBeforePractice = settings.rememberedLyricSize
+            let targetW = max(Settings.practiceComfortableSize.width, settings.panelWidth)
+            let targetH = max(Settings.practiceMinSize.height, Settings.practiceComfortableSize.height)
+            if settings.panelWidth < targetW || settings.panelHeight < targetH {
+                settings.setSize(width: targetW, height: targetH)
             }
             overlay.show()
             overlay.focusForKeyInput()
-        } else if let saved = sizeBeforePractice {
-            settings.setSize(width: saved.0, height: saved.1)
+        } else {
+            let remembered = sizeBeforePractice ?? settings.rememberedLyricSize
             sizeBeforePractice = nil
+            settings.setSize(width: remembered.width, height: remembered.height)
         }
     }
 
@@ -198,35 +263,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 练习时的键盘约定：
-    /// - 空格：切换当前要填的横线（用户不必填满所有空）
-    /// - ⌘A / Shift+方向键：暂不提供选中文字，直接吃掉
+    /// 练习时的键盘入口。
+    ///
+    /// 练习窗内不使用输入法选字：1…6 是数字命令，英文字母直接落进答案；
+    /// 即使系统当前是中文输入法也不弹候选，也不会切换/修改全局输入源。
+    /// - 1…6：重听/朗读、看答案/再试、主操作、跳过、设置、返回
+    /// - 字母/连字符/撇号：直接写入当前空；数字键只做功能，不落字
+    /// - 空格：切到下一个空，末尾回到第一个未填的空
+    /// - 退格：删当前空，删空后回到上一个空
+    /// - ⏎：兼容旧提交/下一句/再来一遍（主提示是 3）
+    /// - Esc：兼容退出练习回歌词（主提示是 6）
     private func installPracticeKeyMonitor() {
         practiceKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self,
-                  event.window === self.overlay.window,
+            guard let self, let window = event.window else { return event }
+
+            // 字号快捷键在练习输入路径之前消费：⌘=/⌘+/⌘- 只改字号，
+            // 不会把 =/+/- 写进答案，也不触发打字机音效。
+            if self.fontShortcuts?.handle(event) == true { return nil }
+
+            guard window === self.overlay.window,
                   self.settings.practiceMode else { return event }
 
-            // 输入法正在组字：空格和方向键先给输入法
-            if let editor = event.window?.firstResponder as? NSTextView, editor.hasMarkedText() {
-                return event
+            let editor = event.window?.firstResponder as? NSTextView
+            // 练习窗不使用输入法选字：任何键（包括 1…6）到来时先清掉残留组字/候选，
+            // 再走数字命令或英文直输。范围仅限自己的练习窗口。
+            if let textView = editor as? PracticeInputTextView,
+               textView.hasMarkedText() || !textView.string.isEmpty {
+                textView.discardPendingComposition()
             }
 
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-            // 不提供选中文字：⌘A 与 Shift+方向键都不做选区
-            if flags.contains(.command),
-               event.charactersIgnoringModifiers?.lowercased() == "a" {
+            // 1) 数字命令必须先于输入法候选/marked text：
+            //    1…6 直接执行动作；0、7…9 没有命令也消费。
+            //    数字不作为真实按键输入，不写答案、不响音效、不选候选。
+            //    带 ⌘/⌃/⌥/Shift 的组合不触发，留给系统快捷键或普通输入。
+            let keyIntent = PracticeKeyRouting.intent(
+                keyCode: event.keyCode,
+                modifiers: flags,
+                characters: event.charactersIgnoringModifiers
+            )
+            switch keyIntent {
+            case .command(let command):
+                self.practice.perform(command)
                 return nil
+            case .consumedDigit:
+                return nil
+            case .letter, .passThrough:
+                break
             }
-            if flags.contains(.shift),
-               [123, 124, 125, 126, 115, 116, 119, 121].contains(Int(event.keyCode)) {
+
+            let source = NSTextInputContext.current?.selectedKeyboardInputSource
+            let plainLayout = PracticeInputRouting.isPlainKeyboardLayout(
+                source: source,
+                hasMarkedText: editor?.hasMarkedText() ?? false
+            )
+            if source != self.lastLoggedInputSource {
+                self.lastLoggedInputSource = source
+                Diag.log("practice: input source \(source ?? "nil") plain=\(plainLayout)")
+            }
+
+            let phase = self.practice.phase
+
+            // 2) 粘贴先于组字处理：只读剪贴板，不覆盖用户内容，也不发声。
+            if flags.contains(.command),
+               event.charactersIgnoringModifiers?.lowercased() == "v" {
+                guard phase == .asking || phase == .listening else { return event }
+                if let text = NSPasteboard.general.string(forType: .string), !text.isEmpty {
+                    self.practice.insertBulk(text)
+                }
                 return nil
             }
 
-            // 纯空格：切到下一个横线（带修饰键的空格留给输入法/系统）
-            if event.keyCode == 49, flags.isEmpty, self.practice.phase == .asking {
-                self.practice.advanceBlank()
+            // 3) 其余带 ⌘/⌃/⌥ 的按键留给菜单、按钮和系统输入法切换
+            if flags.contains(.command) || flags.contains(.control) || flags.contains(.option) {
+                return event
+            }
+
+            // Esc 兼容退出；界面主提示是 6 返回
+            if event.keyCode == 53 {
+                self.practice.exitPractice()
+                return nil
+            }
+
+            switch event.keyCode {
+            case 36, 76:   // Return / keypad Enter
+                switch phase {
+                case .asking, .listening, .revealed, .idle:
+                    self.practice.primaryAction()
+                    return nil
+                case .setup:
+                    return event
+                }
+            case 49:       // Space
+                if phase == .asking || phase == .listening {
+                    self.practice.advanceBlank()
+                    return nil
+                }
+            case 51:       // Delete / Backspace
+                if phase == .asking || phase == .listening {
+                    self.practice.deleteBackward()
+                    return nil
+                }
+            default:
+                break
+            }
+
+            guard phase == .asking || phase == .listening else { return event }
+            // 5) 英文字母直接直通（即使系统当前是中文输入法）：
+            //    一次按键 = 一次落字 = 一次音效，不弹候选、不等上屏。
+            if case .letter(let ch) = keyIntent {
+                self.practice.typeCharacter(ch)
                 return nil
             }
             return event
@@ -267,11 +414,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 直接入口：右键菜单与菜单栏共用；空库也保留并置灰解释
         menu.addItem(quickPracticeItem(
             title: "练当前歌曲", count: songPracticeCount, unit: "句",
-            emptyHint: "先播放一首英文歌", action: #selector(practiceSong)
+            emptyHint: songEmptyHint, action: #selector(practiceSong)
         ))
         menu.addItem(quickPracticeItem(
             title: "练收藏歌词", count: bank.count, unit: "句",
-            emptyHint: "在歌词右侧点书签收藏", action: #selector(practiceFavorites)
+            emptyHint: "全文模式下点歌词右侧书签收藏", action: #selector(practiceFavorites)
         ))
         menu.addItem(quickPracticeItem(
             title: "练错题本", count: mistakes.count, unit: "条",
@@ -303,13 +450,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         intensityItem.submenu = intensityMenu
         practiceMenu.addItem(intensityItem)
 
+        // 句末停顿补偿：LRC 整体偏移时用这里自救（默认延后 0.2s）
+        let tailMenu = makeMenu()
+        for value in Settings.practiceTailChoices {
+            let item = NSMenuItem(
+                title: Settings.practiceTailLabel(value),
+                action: #selector(setPracticeTail(_:)), keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = value
+            item.state = abs(settings.practiceTail - value) < 0.001 ? .on : .off
+            tailMenu.addItem(item)
+        }
+        let tailItem = NSMenuItem(
+            title: "句末停得早/晚（\(settings.practiceTailLabel)）", action: nil, keyEquivalent: ""
+        )
+        tailItem.submenu = tailMenu
+        practiceMenu.addItem(tailItem)
+
+        let soundItem = NSMenuItem(
+            title: "打字机音效", action: #selector(toggleTypingSound), keyEquivalent: ""
+        )
+        soundItem.target = self
+        soundItem.state = settings.typingSound ? .on : .off
+        practiceMenu.addItem(soundItem)
+
         practiceMenu.addItem(quickPracticeItem(
             title: "练当前歌曲", count: songPracticeCount, unit: "句",
-            emptyHint: "先播放一首英文歌", action: #selector(practiceSong)
+            emptyHint: songEmptyHint, action: #selector(practiceSong)
         ))
         practiceMenu.addItem(quickPracticeItem(
             title: "练收藏歌词", count: bank.count, unit: "句",
-            emptyHint: "在歌词右侧点书签收藏", action: #selector(practiceFavorites)
+            emptyHint: "全文模式下点歌词右侧书签收藏", action: #selector(practiceFavorites)
         ))
         practiceMenu.addItem(quickPracticeItem(
             title: "练错题本", count: mistakes.count, unit: "条",
@@ -365,6 +537,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lock.target = self
         lock.state = settings.locked ? .on : .off
         menu.addItem(lock)
+
+        // 背景透明度：只改窗口背景，文字/按钮保持清晰；默认「不透明」= 原有视觉
+        let transparencyMenu = makeMenu()
+        for value in Settings.backgroundTransparencyChoices {
+            let item = NSMenuItem(
+                title: Settings.backgroundTransparencyLabel(value),
+                action: #selector(setBackgroundTransparency(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = value
+            item.state = abs(settings.backgroundTransparency - value) < 0.001 ? .on : .off
+            transparencyMenu.addItem(item)
+        }
+        let transparencyItem = NSMenuItem(
+            title: "背景透明度（\(settings.backgroundTransparencyLabel)）",
+            action: nil,
+            keyEquivalent: ""
+        )
+        transparencyItem.submenu = transparencyMenu
+        menu.addItem(transparencyItem)
 
         menu.addItem(.separator())
 
@@ -462,6 +655,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func setPracticeTail(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        settings.practiceTail = value
+    }
+
+    @objc private func toggleTypingSound() {
+        settings.typingSound.toggle()
+    }
+
+    @objc private func setBackgroundTransparency(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        settings.backgroundTransparency = value
+    }
+
     @objc private func practiceSong() {
         startPractice(source: .song, onlyID: nil)
     }
@@ -529,6 +736,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 },
                 onClearMistakes: { [weak self] in
                     self?.confirmClearMistakes()
+                },
+                confirmDelete: { [weak self] title, message in
+                    self?.confirmDestructive(title: title, message: message) ?? false
                 }
             )
         }
@@ -540,7 +750,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title: "清空收藏歌词？",
             message: "将删除全部 \(bank.count) 句收藏，错题本不受影响。此操作不可撤销。"
         ) { [weak self] in
-            self?.bank.clear()
+            guard let self else { return }
+            if !self.bank.clear() {
+                self.showStorageError(self.bank.storageWarning ?? "收藏写入失败")
+            }
         }
     }
 
@@ -549,8 +762,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title: "清空错题本？",
             message: "将删除全部 \(mistakes.count) 条错题及其 \(mistakes.totalAttempts) 次错误历史。此操作不可撤销。"
         ) { [weak self] in
-            self?.mistakes.clear()
+            guard let self else { return }
+            if !self.mistakes.clear() {
+                self.showStorageError(self.mistakes.saveError ?? "错题本写入失败")
+            }
         }
+    }
+
+    /// 单条删除的确认框：点「取消」返回 false，调用方因此不会写文件
+    private func confirmDestructive(title: String, message: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        alert.buttons.first?.hasDestructiveAction = true
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// 写入失败必须看得见，不能只写日志
+    private func showStorageError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "保存失败"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func showClearConfirmation(title: String, message: String, action: @escaping () -> Void) {
@@ -584,6 +824,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    /// 「练当前歌曲」空库时的解释：区分「没在播放」「歌词还在匹配」和「真的没有可练句」
+    private var songEmptyHint: String {
+        guard state.snapshot != nil else { return "先播放一首英文歌" }
+        switch state.loadState {
+        case .loading: return "歌词匹配中…"
+        case .notFound: return "没有找到这首歌的歌词"
+        case .failed: return "歌词加载失败"
+        case .idle, .loaded: return "这首歌没有适合听写的英文句子"
+        }
+    }
+
+    /// 只在隔离目录里预置演示收藏/错题（全部是原创演示素材）
+    private func seedDemoLibrary() {
+        let first = DemoFixtures.paperLanterns
+        let samples: [(DemoFixtures.Song, String)] = [
+            (first, DemoFixtures.firstLine),
+            (first, DemoFixtures.secondLine),
+            (first, DemoFixtures.thirdLine),
+            (DemoFixtures.signalFires, "We lit signal fires on the eastern hill")
+        ]
+        for (song, text) in samples {
+            let translation = song.translations[text]
+            let time = song.lines.first(where: { $0.text == text })?.time ?? 0
+            _ = bank.add(
+                text: text, translation: translation,
+                title: song.track.title, artist: song.track.artist, lineTime: time
+            )
+        }
+        if mistakes.isEmpty {
+            let target = PracticeQuestion(
+                text: DemoFixtures.secondLine,
+                translation: DemoFixtures.secondTranslation,
+                title: first.track.title,
+                artist: first.track.artist,
+                start: 17.2, end: 22.4, lineTime: 17.2
+            )
+            for (offset, actual) in [0.0, 40.0].enumerated() {
+                let attempt = MistakeAttempt(
+                    submittedAt: Date().addingTimeInterval(-3600 * (offset == 0 ? 2 : 1)),
+                    source: "song",
+                    ratio: 0.6,
+                    rawInput: "we folded paper lanterns",
+                    translation: DemoFixtures.secondTranslation,
+                    wasRetry: false,
+                    blanks: [
+                        MistakeBlank(ordinal: 0, wordIndex: 1, expected: "folded", actual: actual == 0 ? "fold" : "folded", skipped: false),
+                        MistakeBlank(ordinal: 1, wordIndex: 2, expected: "paper", actual: "paper", skipped: false),
+                        MistakeBlank(ordinal: 2, wordIndex: 3, expected: "lanterns", actual: "lanters", skipped: false)
+                    ]
+                )
+                _ = mistakes.record(question: target, translation: DemoFixtures.secondTranslation, attempt: attempt)
+            }
+        }
+        Diag.log("demo-seed: bank=\(bank.count) mistakes=\(mistakes.count)")
+        print("✅ demo seed: 收藏 \(bank.count) 句 · 错题 \(mistakes.count) 条（隔离目录 \(Paths.data.path)）")
+    }
+
     /// 当前歌曲里可听写的句数（菜单里显示）
     private var songPracticeCount: Int {
         guard let lyrics = state.lyrics, !lyrics.lines.isEmpty else { return 0 }
@@ -599,9 +896,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let size = sender.representedObject as? Double { settings.fontSize = size }
     }
 
-    @objc private func fontUp() { settings.bumpFont(by: 2) }
+    @objc private func fontUp() { fontShortcuts?.applyFromMenu(.bigger) }
 
-    @objc private func fontDown() { settings.bumpFont(by: -2) }
+    @objc private func fontDown() { fontShortcuts?.applyFromMenu(.smaller) }
 
     @objc private func setWindowSize(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? [Double], v.count == 2 else { return }
@@ -624,4 +921,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+
+/// 字号快捷键接收：⌘= / ⌘+ / ⌘-（含数字区）。
+///
+/// 状态栏菜单和右键菜单都不是 `NSApp.mainMenu`，菜单关闭时 AppKit 不会把
+/// keyEquivalent 自动路由给我们的窗口，所以这里用一个本地 keyDown 监视器显式接住。
+/// 只处理 GapSong 自己窗口上的事件，不做全局监听；Ctrl / Option 组合一律放行，
+/// 普通字符和输入法候选（没有 ⌘）也不受影响。
+///
+/// 监视器在练习输入路径之前消费事件，`=`/`+`/`-` 不会写进答案，也不会打字机音效；
+/// 改字号只写 `settings.fontSize`，不碰题目、输入、分数、播放时序和重试状态。
+@MainActor
+final class FontShortcutMonitor {
+    enum Action {
+        case bigger
+        case smaller
+
+        /// 每次 2pt；边界由 `Settings.bumpFont` 收在 14…72
+        var delta: Double { self == .bigger ? 2 : -2 }
+    }
+
+    private let settings: Settings
+    private let isOwnWindow: (NSWindow) -> Bool
+    private var lastTimestamp: TimeInterval = -1
+    private var monitor: Any?
+
+    init(settings: Settings, isOwnWindow: @escaping (NSWindow) -> Bool) {
+        self.settings = settings
+        self.isOwnWindow = isOwnWindow
+    }
+
+    func install() {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handle(event) ? nil : event
+        }
+    }
+
+    func uninstall() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+
+    /// 返回 true 表示已消费：调用方必须吞掉事件，不能再交给练习输入。
+    func handle(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              let window = event.window,
+              isOwnWindow(window),
+              let action = Self.action(for: event) else { return false }
+        apply(action, timestamp: event.timestamp)
+        return true
+    }
+
+    /// 菜单点击与菜单 keyEquivalent 的兜底入口，和监视器共用同一个去重状态：
+    /// 万一同一物理事件同时走了菜单和监视器，也只放大/缩小一次。
+    func applyFromMenu(_ action: Action) {
+        apply(action, timestamp: NSApp.currentEvent?.timestamp)
+    }
+
+    private func apply(_ action: Action, timestamp: TimeInterval?) {
+        if let timestamp {
+            guard timestamp != lastTimestamp else { return }
+            lastTimestamp = timestamp
+        }
+        settings.bumpFont(by: action.delta)
+    }
+
+    /// 只认 ⌘ + `=` / `+` / `-`；⌃/⌥ 组合不抢，没有 ⌘ 的普通字符不抢。
+    /// 按键按物理键位匹配（主键盘 = / -、数字区 + / -），再按字符兜底非 US 布局。
+    static func action(for event: NSEvent) -> Action? {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command),
+              !flags.contains(.control),
+              !flags.contains(.option) else { return nil }
+
+        switch event.keyCode {
+        case 24, 69: return .bigger    // 主键盘 =（⌘⇧= 即 ⌘+）与数字区 +
+        case 27, 78: return .smaller   // 主键盘 - 与数字区 -
+        default: break
+        }
+
+        switch event.charactersIgnoringModifiers ?? "" {
+        case "=", "+": return .bigger
+        case "-": return .smaller
+        default: return nil
+        }
+    }
 }

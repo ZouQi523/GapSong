@@ -83,7 +83,7 @@ struct OverlayView: View {
                             }
                         }
                         .padding(.horizontal, full ? 22 : 28)
-                        .padding(.top, full ? 10 : 12)
+                        .padding(.top, 12)
                         .padding(.bottom, full ? 8 : 16)
                         .frame(width: geo.size.width, height: geo.size.height)
                     }
@@ -105,37 +105,68 @@ struct OverlayView: View {
         }
         .overlay(alignment: .bottomTrailing) {
             if !isPreview {
-                ResizeGrip(minWidth: 420, minHeight: 110)
-                    .frame(width: 22, height: 22)
-                    .padding(4)
+                // 练习态窗口下限更高（480×380），歌词态仍是紧凑 420×110
+                ResizeGrip(
+                    minWidth: inPractice ? Settings.practiceMinSize.width : Settings.lyricMinSize.width,
+                    minHeight: inPractice ? Settings.practiceMinSize.height : Settings.lyricMinSize.height
+                )
+                .frame(width: 22, height: 22)
+                .padding(4)
             }
         }
         .translationTask(translator.config) { session in
             await translator.consume(session)
+        }
+        .onChange(of: settings.visible) { _, visible in
+            // 窗被隐藏时不能继续在后台读英语句子
+            if !visible { practice.stopReading() }
         }
     }
 
     // MARK: 背景 / 装饰
 
     private var background: some View {
-        RoundedRectangle(cornerRadius: 22, style: .continuous)
-            .fill(Color(white: 0.05).opacity(0.82))
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+        let transparency = settings.backgroundTransparency
+
+        return ZStack {
+            // 透明时加一层系统材质，文字和按钮仍然清晰；默认 0 时完全不加，视觉不变
+            if transparency > 0.001, !isPreview {
+                WindowMaterialBackground(
+                    alpha: WindowChrome.backgroundBlurAlpha(transparency: transparency)
+                )
+            }
+            Color(white: 0.05)
+                .opacity(WindowChrome.backgroundFillAlpha(transparency: transparency))
+        }
+        .clipShape(shape)
+        .overlay(
+            shape.strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
     private var dragStrip: some View {
-        if !isPreview {
-            WindowDragArea()
-                .frame(height: settings.locked ? 0 : 28)
-                .padding(.leading, 36)
-                // 右侧留给「＋ 收藏」按钮，别让拖动区把点击吃掉
-                .padding(.trailing, 44)
+        if isPreview {
+            // 快照里也画出拖拽抓手，验收能看到可发现的位置
+            dragAffordance
+        } else if WindowChrome.dragStripEnabled(locked: settings.locked) {
+            // 固定顶部留白：只覆盖 12pt 窄带，不碰按钮、填空、滚动和右下角缩放手柄
+            WindowDragBar()
+                .frame(height: WindowChrome.dragStripHeight)
+                .padding(.horizontal, WindowChrome.dragStripInset)
         }
+        // 锁定位置：同高度留白，但不接受拖动
+    }
+
+    /// 顶部居中的短横线：提示「这里可以拖」
+    private var dragAffordance: some View {
+        Capsule()
+            .fill(Color.white.opacity(0.18))
+            .frame(width: 26, height: 2.5)
+            .frame(maxWidth: .infinity)
+            .padding(.top, 5)
+            .allowsHitTesting(false)
     }
 
     private var closeButton: some View {
@@ -176,11 +207,19 @@ struct OverlayView: View {
 
     // MARK: 紧凑模式
 
+    /// 收藏/错题持久化异常的统一提示：紧凑、全文、练习、管理窗口都要能看见
+    var storageWarning: String? {
+        bank.storageWarning ?? mistakes.storageWarning
+    }
+
     @ViewBuilder
     private func compactBody(now: Date) -> some View {
         if let snap = state.snapshot {
             VStack(spacing: 6) {
-                header(snap, showAdd: true)
+                header(snap)
+                if let warning = storageWarning {
+                    StorageWarningBanner(text: warning, compact: true)
+                }
                 Spacer(minLength: 2)
                 lyricBlock(now: now)
                 Spacer(minLength: 2)
@@ -248,6 +287,9 @@ struct OverlayView: View {
         if let snap = state.snapshot {
             VStack(spacing: 6) {
                 header(snap)
+                if let warning = storageWarning {
+                    StorageWarningBanner(text: warning, compact: false)
+                }
                 Divider().overlay(Color.white.opacity(0.08))
                 if let lyrics = state.lyrics, !lyrics.lines.isEmpty {
                     lyricList(lyrics, now: now)
@@ -394,7 +436,7 @@ struct OverlayView: View {
 
     // MARK: 公共块
 
-    private func header(_ snap: MusicSnapshot, showAdd: Bool = false) -> some View {
+    private func header(_ snap: MusicSnapshot) -> some View {
         HStack(spacing: 8) {
             // 给左上角的关闭按钮留位
             Color.clear.frame(width: 12, height: 1)
@@ -417,23 +459,7 @@ struct OverlayView: View {
                     .padding(.trailing, 4)
             }
             statusBadge
-            if showAdd, let line = currentLine {
-                BankAddButton(
-                    added: bank.contains(text: line.text, title: snap.track.title),
-                    enabled: PracticeBlanks.isPracticeable(line.text)
-                ) {
-                    toggleBank(line)
-                }
-                .padding(.leading, 2)
-                .help("收藏当前这句歌词")
-            }
         }
-    }
-
-    private var currentLine: LyricLine? {
-        guard let lyrics = state.lyrics, lyrics.synced, !lyrics.lines.isEmpty else { return nil }
-        guard let index = state.lineIndex(at: state.position()) else { return nil }
-        return lyrics.lines[index]
     }
 
     @ViewBuilder
@@ -494,6 +520,10 @@ struct OverlayView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.white.opacity(0.3))
                 .multilineTextAlignment(.center)
+            if let warning = storageWarning {
+                StorageWarningBanner(text: warning, compact: true)
+                    .padding(.top, 2)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -506,14 +536,14 @@ struct OverlayView: View {
             showToast("这句没有可听写的英文内容")
             return
         }
-        let added = bank.toggle(
+        let result = bank.toggle(
             text: line.text,
             translation: translator.translation(for: line.text),
             title: track.title,
             artist: track.artist,
             lineTime: line.time
         )
-        showToast(added ? "已收藏 · 共 \(bank.count) 句" : "已取消收藏 · 共 \(bank.count) 句")
+        showToast(result.toastText(count: bank.count))
     }
 
     private func showToast(_ text: String) {
@@ -541,7 +571,8 @@ struct OverlayView: View {
 
 }
 
-/// 歌词行末尾的收藏按钮：点一下收藏，再点一下取消
+/// 全文模式里每句右侧的收藏书签：点一下收藏，再点一下取消。
+/// 紧凑歌词窗和练习页不再放顶部收藏入口，这里保留逐句收藏能力。
 private struct BankAddButton: View {
     let added: Bool
     let enabled: Bool
@@ -556,11 +587,13 @@ private struct BankAddButton: View {
                 .foregroundStyle(
                     added
                         ? Color(red: 0.45, green: 0.86, blue: 0.55).opacity(enabled ? 1 : 0.4)
-                        : Color.white.opacity(enabled ? (hover ? 0.9 : 0.38) : 0.12)
+                        : Color.white.opacity(enabled ? (hover ? 0.95 : 0.62) : 0.15)
                 )
                 .frame(width: 22, height: 22)
-                .background(Circle().fill(Color.white.opacity(hover && enabled ? 0.12 : 0)))
-                .contentShape(Circle())
+                .background(
+                    Capsule().fill(Color.white.opacity(hover && enabled ? 0.14 : 0))
+                )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
@@ -568,7 +601,39 @@ private struct BankAddButton: View {
         .help(
             !enabled
                 ? "这句没有可听写的英文内容"
-                : (added ? "已收藏，点击取消" : "收藏这句歌词")
+                : (added ? "已收藏，点击取消" : "收藏这句歌词（全文模式下每句右侧都有书签）")
+        )
+    }
+}
+
+/// 收藏/错题的持久化异常提示（紧凑、全文、练习、管理窗口共用同一套说法）
+struct StorageWarningBanner: View {
+    var text: String
+    var compact: Bool = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 5) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: compact ? 8.5 : 10, weight: .semibold))
+                .padding(.top, compact ? 1 : 1.5)
+            Text(text)
+                .font(.system(size: compact ? 9 : 10))
+                .lineLimit(compact ? 1 : 2)
+                .minimumScaleFactor(0.75)
+                .fixedSize(horizontal: false, vertical: compact)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(Color(red: 1.0, green: 0.67, blue: 0.45))
+        .padding(.horizontal, 7)
+        .padding(.vertical, compact ? 2.5 : 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 1)
         )
     }
 }

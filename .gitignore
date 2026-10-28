@@ -21,6 +21,7 @@ Package.resolved
 *.swp
 
 # Logs and generated snapshots
+/tmp/
 *.log
 retry.png
 
