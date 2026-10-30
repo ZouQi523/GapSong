@@ -29,6 +29,8 @@ struct OverlayView: View {
     @ObservedObject var practice: PracticeEngine
     @ObservedObject var bank: QuestionBank
     @ObservedObject var mistakes: MistakeBook
+    /// 1 打开的窗口内键盘菜单
+    @ObservedObject var menu: CommandMenu
     /// 仅离屏预览用：预置被点开的词
     var previewSelectedWord: String? = nil
     @Environment(\.lyricPreview) private var isPreview
@@ -54,7 +56,8 @@ struct OverlayView: View {
                             settings: settings,
                             engine: practice,
                             bank: bank,
-                            mistakes: mistakes
+                            mistakes: mistakes,
+                            onOpenMenu: { menu.open() }
                         )
                     } else {
                         PracticeView(
@@ -64,7 +67,8 @@ struct OverlayView: View {
                             translator: translator,
                             bank: bank,
                             mistakes: mistakes,
-                            initialSelectedWord: previewSelectedWord
+                            initialSelectedWord: previewSelectedWord,
+                            onOpenMenu: { menu.open() }
                         )
                     }
                 }
@@ -120,6 +124,13 @@ struct OverlayView: View {
         .onChange(of: settings.visible) { _, visible in
             // 窗被隐藏时不能继续在后台读英语句子
             if !visible { practice.stopReading() }
+        }
+        // 菜单画在最上层：打开时盖住歌词/练习内容和拖拽条、缩放柄，
+        // 关掉后原界面原样回来（窗口高度由 OverlayController 负责还原）
+        .overlay {
+            if menu.isOpen {
+                CommandMenuView(menu: menu)
+            }
         }
     }
 
@@ -458,8 +469,26 @@ struct OverlayView: View {
                     .foregroundStyle(.white.opacity(0.25))
                     .padding(.trailing, 4)
             }
+            menuPill
             statusBadge
         }
+    }
+
+    /// 1 菜单键的可见入口：键盘用户不用去找右键菜单
+    private var menuPill: some View {
+        Button {
+            menu.open()
+        } label: {
+            Text("1 菜单")
+                .font(.system(size: 9.5, weight: .medium))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2.5)
+                .background(Capsule().fill(Color.white.opacity(0.08)))
+                .foregroundStyle(.white.opacity(0.62))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("按 1 打开键盘菜单：显示/练习/收藏/字号/窗口等都能用数字完成")
     }
 
     @ViewBuilder
@@ -516,10 +545,11 @@ struct OverlayView: View {
             Text("♫ 在 Apple Music 里播放一首歌")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.white.opacity(0.6))
-            Text(state.hint ?? "歌词会自动匹配并翻译 · 右键查看更多")
+            Text(state.hint ?? "歌词会自动匹配并翻译 · 按 1 打开菜单")
                 .font(.system(size: 10))
                 .foregroundStyle(.white.opacity(0.3))
                 .multilineTextAlignment(.center)
+            menuPill
             if let warning = storageWarning {
                 StorageWarningBanner(text: warning, compact: true)
                     .padding(.top, 2)

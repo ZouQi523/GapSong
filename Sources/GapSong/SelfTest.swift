@@ -61,7 +61,14 @@ enum SelfTest {
             await testInputSourceRouting()
             await testFontShortcuts()
             await testNumericCommandsAndKeyRouting()
+            await testCommandMenuCatalog()
+            await testCommandMenuNavigation()
+            await testCommandMenuLayout()
+            await testSetupRatioAdjustment()
             await testSpeechReaderLifecycle()
+            await testOfflinePracticeAutoRead()
+            await testSongReadingFallback()
+            await testLibraryReviewPause()
             await testWindowChromeAndDrag()
             await testEmptySubmitCoaching()
             await testStatsWording()
@@ -264,6 +271,19 @@ enum SelfTest {
         func finish(token: UInt64) {
             isSpeaking = false
             onFinish?(token)
+        }
+    }
+
+    /// 等一个异步条件成立（最多 timeout 秒）。固定 sleep 在机器负载高时
+    /// 会让「主队列还没跑到」的检查偶发失败，这里改成轮询。
+    @MainActor
+    private static func waitUntil(
+        timeout: TimeInterval = 2,
+        _ condition: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
     }
 
@@ -2166,6 +2186,12 @@ enum SelfTest {
         check(focusRequests > 0, "切强度后重新请求输入焦点")
         engine.input = "keep"
         check(engine.input == "keep" && engine.phase == .asking, "切强度后可以继续输入")
+
+        // 菜单里再选当前这一档：不重挖、不清空已填内容
+        let blanksBefore = engine.blankIndices
+        engine.changeRatio(settings.practiceRatio)
+        check(engine.input == "keep" && engine.blankIndices == blanksBefore,
+              "选当前强度档不会清空已填内容")
         engine.setEnabled(false)
         try? FileManager.default.removeItem(at: bankURL)
     }
@@ -2354,8 +2380,11 @@ enum SelfTest {
         watcher.onRecovered = { recovered += 1 }
 
         let bank = QuestionBank(url: tempURL("forward-bank"))
+        // 播放器用 Noop：这个测试只验证 watcher → 引擎的问题转发。
+        // 如果给引擎真的 MusicWatcher，begin() 的 seek 会在后台触发真实 AppleScript，
+        // 迟到的真实错误会顶掉这里注入的问题，测试就变成在赌本机 Music 的状态。
         let engine = PracticeEngine(
-            state: state, watcher: watcher, settings: settings, bank: bank,
+            state: state, watcher: NoopMusicController(), settings: settings, bank: bank,
             mistakes: MistakeBook(url: tempURL("forward-mistakes"))
         )
         // 与 AppDelegate 一致的桥接
@@ -2367,18 +2396,18 @@ enum SelfTest {
         engine.begin(source: .song, ratio: 1.0)
 
         watcher.debugReport(.unauthorized)
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await waitUntil { kinds.count == 1 }
         check(kinds.count == 1 && kinds.first == .unauthorized,
               "MusicProblem 从 watcher 以 typed 形式上报")
         check(hints.first?.contains("授权") == true, "旧字符串提示仍然给出")
         check(engine.playbackNotice == .unauthorized, "typed 问题确实进了练习界面")
 
         watcher.debugReportRecovered()
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await waitUntil { recovered == 1 }
         check(recovered == 1, "采样恢复后通知界面清除旧提示")
 
         watcher.debugReport(.readFailed(-1))
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await waitUntil { kinds.count == 2 }
         check(kinds.count == 2 && kinds.last == .readFailed(-1),
               "恢复之后再次失败仍会重新上报（不会永久哑掉）")
         check(engine.playbackNotice == .readFailed(-1), "新问题替换旧提示")
@@ -2558,7 +2587,7 @@ enum SelfTest {
         let (settings, defaults, suite) = makeSettings()
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        // 主键盘 / 小键盘：1…0 全部按物理键码认识，1…6 才有命令
+        // 主键盘 / 小键盘：1…0 全部按物理键码认识，1 是菜单键、2…8 才有练习命令
         let mainRow: [(UInt16, Int)] = [
             (18, 1), (19, 2), (20, 3), (21, 4), (23, 5), (22, 6),
             (26, 7), (28, 8), (25, 9), (29, 0)
@@ -2571,11 +2600,12 @@ enum SelfTest {
               "主键盘 1…0 的物理键码映射")
         check(keypad.allSatisfy { PracticeNumericKeys.digit(forKeyCode: $0.0) == $0.1 },
               "小键盘 1…0 的物理键码映射")
-        check((1...6).allSatisfy { PracticeCommand(rawValue: $0) != nil },
-              "1…6 各自对应一个动作")
-        check([26, 28, 25, 29, 89, 91, 92, 82].allSatisfy {
+        check((2...8).allSatisfy { PracticeCommand(rawValue: $0) != nil },
+              "2…8 各自对应一个动作")
+        check(PracticeCommand(rawValue: 1) == nil, "1 固定留给菜单，不属于练习命令")
+        check([25, 29, 92, 82].allSatisfy {
             PracticeNumericKeys.command(forKeyCode: UInt16($0)) == nil
-        }, "7…0 没有功能（仍会被消费）")
+        }, "9/0 没有练习功能（仍会被消费）")
 
         // 真实 NSEvent 走同一条纯路由
         func keyEvent(_ code: UInt16, _ chars: String, _ flags: NSEvent.ModifierFlags = []) -> NSEvent? {
@@ -2601,10 +2631,17 @@ enum SelfTest {
             )
         }
 
-        check(intent(18, "1") == .command(.replayOrRead), "主键盘 1 → 重听/朗读")
-        check(intent(83, "1") == .command(.replayOrRead), "小键盘 1 → 重听/朗读")
-        check(intent(22, "6") == .command(.exitPractice), "6 → 返回歌词")
-        check(intent(26, "7") == .consumedDigit, "7 无动作但消费，不落字")
+        check(intent(18, "1") == .openMenu, "主键盘 1 → 打开键盘菜单")
+        check(intent(83, "1") == .openMenu, "小键盘 1 → 打开键盘菜单")
+        check(intent(19, "2") == .command(.replayOrRead), "2 → 重听/朗读")
+        check(intent(20, "3") == .command(.revealOrRetry), "3 → 看答案/再试")
+        check(intent(21, "4") == .command(.primary), "4 → 主操作")
+        check(intent(23, "5") == .command(.skip), "5 → 跳过")
+        check(intent(22, "6") == .command(.backToSetup), "6 → 返回设置")
+        check(intent(26, "7") == .command(.exitPractice), "7 → 返回歌词")
+        check(intent(28, "8") == .command(.readAloud), "8 → 歌曲清晰朗读")
+        check(intent(89, "7") == .command(.exitPractice), "小键盘 7 → 返回歌词")
+        check(intent(25, "9") == .consumedDigit, "9 无动作但消费，不落字")
         check(intent(29, "0") == .consumedDigit, "0 无动作但消费，不落字")
         check(intent(82, "0") == .consumedDigit, "小键盘 0 同样消费")
         check(intent(0, "a") == .letter("a"), "普通字母仍直接输入")
@@ -2613,7 +2650,7 @@ enum SelfTest {
         check(intent(18, "1", .option) == .passThrough, "⌥1 不触发功能")
         check(intent(18, "1", .control) == .passThrough, "⌃1 不触发功能")
         check(intent(18, "!", .shift) == .passThrough, "Shift+1 不触发功能")
-        check(intent(18, "1", .numericPad) == .command(.replayOrRead),
+        check(intent(18, "1", .numericPad) == .openMenu,
               "小键盘数字即使带 numericPad 也正常触发")
 
         let allDigitCodes: [UInt16] = [
@@ -2647,8 +2684,8 @@ enum SelfTest {
             engine.perform(command)
         }
         check(engine.input == inputBefore,
-              "1…6 不把数字写进答案")
-        check(sound.plays == 0, "1…6 不响打字机音效")
+              "2…8 不把数字写进答案")
+        check(sound.plays == 0, "2…8 不响打字机音效")
         engine.setEnabled(false)
 
         // 阶段映射：可见按钮标题 = 按键动作，且收听中不抢提交
@@ -2670,13 +2707,13 @@ enum SelfTest {
             phase: .asking, input: "I kept", verdict: nil, current: q,
             revealed: nil, progress: "1 / 2", score: 0, streak: 0, source: .song
         )
-        check(phaseEngine.commandTitle(.replayOrRead) == "1 重听"
-              && phaseEngine.commandTitle(.revealOrRetry) == "2 看答案"
+        check(phaseEngine.commandTitle(.replayOrRead) == "2 重听"
+              && phaseEngine.commandTitle(.revealOrRetry) == "3 看答案"
               && phaseEngine.commandTitle(.primary) == nil
-              && phaseEngine.commandTitle(.skip) == "4 跳过"
-              && phaseEngine.commandTitle(.backToSetup) == "5 设置"
-              && phaseEngine.commandTitle(.exitPractice) == "6 返回",
-              "答题阶段不再有 3 提交，1/2/4/5/6 标签保持")
+              && phaseEngine.commandTitle(.skip) == "5 跳过"
+              && phaseEngine.commandTitle(.backToSetup) == "6 设置"
+              && phaseEngine.commandTitle(.exitPractice) == "7 返回",
+              "答题阶段不再有主操作按钮，2/3/5/6/7 标签保持")
         check(phaseEngine.showsReturnHint, "答题阶段显示「回车继续」提示条件")
         let askingScore = phaseEngine.score
         phaseEngine.perform(.primary)
@@ -2709,8 +2746,8 @@ enum SelfTest {
             phase: .revealed, input: "I kept", verdict: nil, current: q,
             revealed: q, progress: "1 / 2", score: 0, streak: 0, source: .song
         )
-        check(phaseEngine.commandTitle(.revealOrRetry) == "2 再试"
-              && phaseEngine.commandTitle(.primary) == "3 下一句"
+        check(phaseEngine.commandTitle(.revealOrRetry) == "3 再试"
+              && phaseEngine.commandTitle(.primary) == "4 下一句"
               && phaseEngine.commandTitle(.skip) == nil,
               "揭示阶段 2/3 映射")
 
@@ -2719,22 +2756,324 @@ enum SelfTest {
             revealed: nil, progress: "", score: 5, streak: 0, source: .bank,
             stats: PracticeEngine.Stats(correct: 1, wrong: 0)
         )
-        check(phaseEngine.commandTitle(.primary) == "3 再来一遍"
-              && phaseEngine.commandTitle(.backToSetup) == "5 设置"
-              && phaseEngine.commandTitle(.exitPractice) == "6 返回",
+        check(phaseEngine.commandTitle(.primary) == "4 再来一遍"
+              && phaseEngine.commandTitle(.backToSetup) == "6 设置"
+              && phaseEngine.commandTitle(.exitPractice) == "7 返回",
               "结束阶段 3/5/6 映射")
 
-        // 设置阶段：3 开始使用引擎里的来源（数字键与按钮一致）
+        // 设置阶段：4 开始使用引擎里的来源（数字键与按钮一致）
         phaseEngine.setEnabled(true)
         phaseEngine.selectSetupSource(.bank)
-        check(phaseEngine.commandTitle(.primary) == "3 开始",
-              "设置阶段 3 是开始")
+        check(phaseEngine.commandTitle(.primary) == "4 开始",
+              "设置阶段 4 是开始")
         check(phaseEngine.commandTitle(.backToSetup) == nil,
-              "已经在设置页时不再显示 5")
+              "已经在设置页时不再显示 6")
         phaseEngine.perform(.primary)
         check(phaseEngine.phase == .asking && phaseEngine.current != nil,
-              "数字 3 在设置页真的开始练习")
+              "数字 4 在设置页真的开始练习")
         phaseEngine.setEnabled(false)
+    }
+
+    // MARK: 键盘菜单
+
+    /// 菜单结构：每页最多 9 项、所有现有操作都能用数字到达、状态/可用性跟着实时值走。
+    @MainActor
+    private static func testCommandMenuCatalog() {
+        let (settings, defaults, suite) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        settings.practiceRatio = 0.6
+        settings.practiceTail = 0.2
+
+        var context = CommandMenuContext()
+        context.practiceMode = true
+        context.songLineCount = 6
+        context.bankCount = 3
+        context.mistakeCount = 2
+        context.ratio = settings.practiceRatio
+        context.tail = settings.practiceTail
+        context.fontSize = settings.fontSize
+        context.panelWidth = settings.panelWidth
+        context.panelHeight = settings.panelHeight
+        context.languageID = settings.targetLanguageID
+
+        let root = CommandMenuCatalog.root(context)
+        check(root.count == 9, "根菜单 9 项，刚好对应数字 1…9")
+        check(root.map(\.title) == [
+            "练习", "收藏与错题", "外观", "字号", "窗口大小",
+            "翻译", "歌词", "隐藏歌词窗", "退出 GapSong"
+        ], "根菜单顺序稳定（隐藏窗口放在后段，避免误触）")
+
+        // 每一层都不超过 9 项：数字 1…9 足够，不需要翻页
+        var maxItems = 0
+        var actions: Set<CommandAction> = []
+        func walk(_ items: [CommandMenuItem], depth: Int) {
+            maxItems = max(maxItems, items.count)
+            for item in items {
+                if let action = item.action { actions.insert(action) }
+                walk(item.children, depth: depth + 1)
+            }
+        }
+        walk(root, depth: 0)
+        check(maxItems <= 9, "所有子菜单都不超过 9 项（最大 \(maxItems)）")
+
+        let expected: Set<CommandAction> = [
+            .toggleVisible, .toggleTranslation, .togglePractice,
+            .practiceSong, .practiceFavorites, .practiceMistakes,
+            .openLibrary, .openMistakesLibrary, .clearFavorites, .clearMistakes,
+            .setRatio(0.3), .setTail(-0.2), .toggleTypingSound, .toggleLock,
+            .setTransparency(0), .setFont(18), .fontUp, .fontDown,
+            .setWindowSize(width: 836, height: 155), .toggleFull,
+            .setLanguage("zh-Hans"), .reloadLyrics, .retryTranslation,
+            .returnToSetup, .quit
+        ]
+        check(actions.isSuperset(of: expected),
+              "菜单覆盖所有动作（\(actions.count) 项，至少 \(expected.count) 类）")
+        check(Set(CommandMenuCatalog.languages.map(\.id))
+                  == Set(["zh-Hans", "zh-Hant", "en", "ja", "ko"]),
+              "五档目标语言都在菜单里")
+
+        // 练习页：数字 2/3/4 直接是练三库，5/6/7 是子菜单/开关/返回
+        guard let practicePage = root.first(where: { $0.title == "练习" })?.children else {
+            check(false, "练习子菜单存在")
+            return
+        }
+        check(practicePage.count == 8, "练习页 8 项")
+        check(practicePage[0].title == "退出练习（听写）" && practicePage[0].action == .togglePractice,
+              "练习中第 1 项是退出练习")
+        check(practicePage[1].action == .practiceSong && practicePage[1].isEnabled,
+              "第 2 项练当前歌曲可用（有 6 句）")
+        check(practicePage[2].detail == "3 句" && practicePage[3].detail == "2 条",
+              "收藏/错题行尾显示真实数量")
+        check(practicePage[4].children.count == 8 && practicePage[5].children.count == 7,
+              "填空强度 8 档、句末延迟 7 档")
+        check(practicePage[6].isOn == context.typingSound, "打字机音效显示开关状态")
+        check(practicePage[7].isEnabled, "练习中可返回设置页")
+
+        // 空库时入口置灰，但菜单项仍保留编号与解释
+        var empty = context
+        empty.songLineCount = 0
+        empty.bankCount = 0
+        empty.mistakeCount = 0
+        let emptyPractice = CommandMenuCatalog.root(empty)
+            .first(where: { $0.title == "练习" })?.children ?? []
+        check(emptyPractice.count == 8
+              && !emptyPractice[1].isEnabled
+              && !emptyPractice[2].isEnabled
+              && !emptyPractice[3].isEnabled,
+              "空库时三个练习入口置灰但位置不变")
+        let emptyLibrary = CommandMenuCatalog.root(empty)
+            .first(where: { $0.title == "收藏与错题" })?.children ?? []
+        check(emptyLibrary.count == 4 && !emptyLibrary[2].isEnabled && !emptyLibrary[3].isEnabled,
+              "空库时清空入口置灰")
+
+        // 勾选状态：强度、字号、窗口、语言都对上当前值
+        let ratioPage = practicePage[4].children
+        check(ratioPage.filter(\.isOn).count == 1
+              && ratioPage.first(where: { $0.isOn })?.action == .setRatio(0.6),
+              "强度菜单只勾当前档")
+        let fontPage = root.first(where: { $0.title == "字号" })?.children ?? []
+        check(fontPage.count == 6 && fontPage.filter(\.isOn).count == 1,
+              "字号菜单 4 档 + 放大/缩小，且只勾当前档")
+        let windowPage = root.first(where: { $0.title == "窗口大小" })?.children ?? []
+        check(windowPage.count == 4 && windowPage.filter(\.isOn).count == 1,
+              "窗口大小 4 档且只勾当前档")
+        let translationPage = root.first(where: { $0.title == "翻译" })?.children ?? []
+        check(translationPage.count == 6 && translationPage[0].action == .toggleTranslation
+              && translationPage.dropFirst().filter(\.isOn).count == 1,
+              "翻译菜单 1 个开关 + 5 档语言，只勾当前语言")
+        let lyricsPage = root.first(where: { $0.title == "歌词" })?.children ?? []
+        check(lyricsPage.count == 2, "没有歌词来源/翻译提示时只留两个动作")
+        var withInfo = context
+        withInfo.lyricSource = "LRCLIB"
+        withInfo.translationNotice = "语言包未下载"
+        let lyricsWithInfo = CommandMenuCatalog.root(withInfo)
+            .first(where: { $0.title == "歌词" })?.children ?? []
+        check(lyricsWithInfo.count == 4
+              && !lyricsWithInfo[2].isEnabled
+              && !lyricsWithInfo[3].isEnabled,
+              "歌词来源/翻译提示作为不可选信息行")
+    }
+
+    /// 菜单状态机：1…9 选、子菜单进出、0/Esc 返回、动作执行后自动关闭。
+    @MainActor
+    private static func testCommandMenuNavigation() {
+        let menu = CommandMenu()
+        var performed: [CommandAction] = []
+        var openChanges: [Bool] = []
+        menu.onPerform = { performed.append($0) }
+        menu.onOpenChange = { openChanges.append($0) }
+        menu.rootProvider = {
+            [
+                CommandMenuItem(
+                    title: "练习",
+                    children: [
+                        CommandMenuItem(title: "练当前歌曲", action: .practiceSong),
+                        CommandMenuItem(title: "练收藏", isEnabled: false, action: .practiceFavorites),
+                        CommandMenuItem(title: "练错题", action: .practiceMistakes)
+                    ]
+                ),
+                CommandMenuItem(title: "退出", action: .quit),
+                CommandMenuItem(title: "信息", isEnabled: false)
+            ]
+        }
+
+        check(!menu.isOpen && menu.breadcrumb.isEmpty, "菜单初始关闭")
+
+        menu.open()
+        check(menu.isOpen && openChanges == [true], "按 1 打开菜单并通知窗口放大")
+        check(menu.page.items.count == 3 && menu.breadcrumb.isEmpty, "根页 3 项且不重复显示「菜单」")
+        check(!menu.canGoBack, "根菜单不能再返回")
+
+        menu.select(1)
+        check(menu.isOpen && menu.canGoBack, "选子菜单后仍打开且可返回")
+        check(menu.breadcrumb == "练习" && menu.page.items.count == 3, "进入练习子页")
+        check(performed.isEmpty, "进入子菜单不执行动作")
+
+        menu.select(2)
+        check(menu.page.items.count == 3 && menu.notice != nil, "不可用项不发动作、给出提示")
+        check(performed.isEmpty, "不可用项不执行")
+
+        menu.select(3)
+        check(performed == [.practiceMistakes], "选中叶子动作")
+        check(!menu.isOpen && openChanges == [true, false], "执行动作后菜单关闭并还原窗口")
+
+        menu.open()
+        menu.select(1)
+        menu.select(1)
+        check(performed == [.practiceMistakes, .practiceSong], "子菜单第 1 项可执行")
+        check(!menu.isOpen, "执行后关闭")
+
+        menu.open()
+        menu.select(2)
+        check(performed == [.practiceMistakes, .practiceSong, .quit] && !menu.isOpen,
+              "根菜单第 2 项直接执行")
+        menu.open()
+        menu.select(3)
+        check(menu.isOpen && menu.notice != nil && performed.count == 3,
+              "不可用根项不会执行，给出提示并停在菜单里")
+        menu.close()
+
+        menu.open()
+        menu.select(1)
+        menu.select(9)
+        check(menu.page.title == "练习" && menu.isOpen, "超范围数字不会误选")
+        menu.back()
+        check(menu.isOpen && menu.breadcrumb.isEmpty, "0 / Esc 返回上一级")
+        menu.back()
+        check(!menu.isOpen && openChanges.last == false, "根菜单再返回就关闭")
+        menu.back()
+        check(!menu.isOpen, "关闭后再返回无副作用")
+
+        // 打开期间重复按 1 不应重置到根页
+        menu.open()
+        menu.select(1)
+        menu.open()
+        check(menu.page.title == "练习", "菜单已打开时再按 1 保持当前页")
+        menu.close()
+    }
+
+    /// 菜单打开时窗口临时放大、关闭还原；临时尺寸不写回用户偏好。
+    @MainActor
+    private static func testCommandMenuLayout() {
+        let (settings, defaults, suite) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        settings.setSize(width: 836, height: 155)
+
+        let state = PlayerState()
+        let bank = QuestionBank(url: tempURL("menu-layout-bank"))
+        let book = MistakeBook(url: tempURL("menu-layout-mistakes"))
+        let engine = PracticeEngine(
+            state: state, watcher: NoopMusicController(), settings: settings,
+            bank: bank, mistakes: book
+        )
+        let menu = CommandMenu()
+        let controller = OverlayController(
+            state: state, settings: settings, practice: engine,
+            bank: bank, mistakes: book, menu: menu
+        )
+
+        let beforeFrame = controller.window.frame
+        let before = beforeFrame.size
+        check(before.height < OverlayController.menuMinSize.height, "菜单打开前是紧凑歌词窗")
+        let savedHeight = settings.panelHeight
+
+        controller.setMenuLayout(true)
+        let opened = controller.window.frame.size
+        check(opened.width >= OverlayController.menuMinSize.width
+                  && opened.height >= OverlayController.menuMinSize.height,
+              "菜单打开时窗口临时放大: \(opened.width)×\(opened.height)")
+        check(abs(settings.panelHeight - savedHeight) < 0.5,
+              "菜单临时尺寸不写回用户偏好")
+
+        controller.setMenuLayout(false)
+        let restoredFrame = controller.window.frame
+        let restored = restoredFrame.size
+        check(abs(restored.width - before.width) < 0.5
+                  && abs(restored.height - before.height) < 0.5,
+              "关闭菜单恢复原尺寸: \(restored.width)×\(restored.height)")
+        check(abs(restoredFrame.origin.x - beforeFrame.origin.x) < 0.5
+                  && abs(restoredFrame.origin.y - beforeFrame.origin.y) < 0.5,
+              "关闭菜单连位置一起还原（靠边打开不会留下位移）")
+        controller.hide()
+    }
+
+    /// 设置页的 2 / 3：按预设档位增减填写比例，两端停住，答题中不生效。
+    @MainActor
+    private static func testSetupRatioAdjustment() {
+        let (settings, defaults, suite) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        settings.practiceRatio = 0.5
+        let bank = QuestionBank(url: tempURL("setup-ratio-bank"))
+        bank.add(text: "I kept the lanterns burning low", translation: nil,
+                 title: "Fixture", artist: "Test", lineTime: 1)
+        let engine = PracticeEngine(
+            state: PlayerState(), watcher: NoopMusicController(), settings: settings,
+            bank: bank, mistakes: MistakeBook(url: tempURL("setup-ratio-mistakes"))
+        )
+        engine.setEnabled(true)
+        check(engine.phase == .setup, "调整比例只在设置页")
+
+        engine.adjustSetupRatio(by: 1)
+        check(abs(settings.practiceRatio - 0.6) < 0.001, "3 增加一档到 60%")
+        engine.adjustSetupRatio(by: -1)
+        check(abs(settings.practiceRatio - 0.5) < 0.001, "2 减少一档到 50%")
+
+        engine.adjustSetupRatio(by: -1)
+        engine.adjustSetupRatio(by: -1)
+        engine.adjustSetupRatio(by: -1)
+        check(abs(settings.practiceRatio - 0.3) < 0.001, "最低停在 30%")
+
+        settings.practiceRatio = 1.0
+        engine.adjustSetupRatio(by: 1)
+        check(abs(settings.practiceRatio - 1.0) < 0.001, "最高停在 100%")
+
+        // 菜单里改过 5% 档位时，2/3 仍能取到最近档
+        settings.practiceRatio = 0.55
+        engine.adjustSetupRatio(by: -1)
+        check(abs(settings.practiceRatio - 0.5) < 0.001, "非预设值向下取最近档")
+        engine.adjustSetupRatio(by: 1)
+        check(abs(settings.practiceRatio - 0.6) < 0.001, "再向上取最近档")
+
+        // 已经开始答题：2/3 是重听/看答案，不改设置页比例
+        engine.begin(source: .bank, ratio: 0.6)
+        let startedAt = settings.practiceRatio
+        engine.adjustSetupRatio(by: 1)
+        engine.adjustSetupRatio(by: -1)
+        check(abs(settings.practiceRatio - startedAt) < 0.001,
+              "答题中不会误改设置页比例")
+
+        // 菜单入口的流程：回到设置页并把来源带入，按 4 才真正开始
+        engine.setEnabled(true)
+        engine.selectSetupSource(.bank)
+        check(engine.phase == .setup && engine.setupSource == .bank && engine.current == nil,
+              "菜单入口停在设置页并带入来源")
+        engine.perform(.primary)
+        check(engine.phase == .asking, "设置页按 4 才开始答题")
+        engine.returnToSetup()
+        check(engine.phase == .setup && engine.setupSource == .bank,
+              "从收藏会话回到设置页仍保留收藏来源")
+        engine.setEnabled(false)
     }
 
     // MARK: 本地朗读生命周期
@@ -2758,30 +3097,36 @@ enum SelfTest {
         engine.installSpeechSpeaker(spy)
 
         engine.begin(source: .bank, ratio: 1.0)
-        check(!engine.isSpeaking, "进入练习不自动朗读")
-        check(spy.spoken.isEmpty, "没有用户操作就不会发朗读请求")
-        check(engine.commandTitle(.replayOrRead) == "1 朗读", "收藏练习有 1 朗读")
+        check(engine.isSpeaking, "进入收藏练习自动朗读（朗读即这次练习的播放）")
+        check(spy.spoken.count == 1 && spy.spoken.first?.text == engine.current?.text,
+              "自动朗读的是刚进入的英文原句")
+        check(engine.commandTitle(.replayOrRead) == "2 停止", "自动朗读时 2 是停止")
+        check(engine.commandTitle(.readAloud) == nil, "收藏练习只用 2 朗读，不显示 8")
+        check(engine.score == 0 && engine.stats.correct == 0 && engine.stats.wrong == 0,
+              "自动朗读不影响分数/统计")
+
+        engine.perform(.replayOrRead)
+        check(!engine.isSpeaking && spy.spoken.count == 1, "朗读中按 2 是停止，不重复叠音")
 
         let first = engine.current?.text
         engine.perform(.replayOrRead)
-        check(spy.spoken.count == 1 && spy.spoken.first?.text == first,
-              "1 朗读当前英文原句")
+        check(spy.spoken.count == 2 && spy.spoken.last?.text == first,
+              "2 朗读当前英文原句")
         check(engine.isSpeaking, "朗读中状态可见")
-        check(engine.score == 0 && engine.stats.correct == 0 && engine.stats.wrong == 0,
-              "朗读不影响分数/统计")
 
         engine.perform(.replayOrRead)
-        check(!engine.isSpeaking && spy.spoken.count == 1,
-              "朗读中再按 1 是停止，不重复叠音")
+        check(!engine.isSpeaking && spy.spoken.count == 2,
+              "朗读中再按 2 是停止，不重复叠音")
 
         engine.perform(.replayOrRead)
         let oldToken = spy.spoken.last!.token
+        let stopsBeforeNext = spy.stops
         engine.next()
-        check(!engine.isSpeaking, "换题取消旧朗读")
-        check(spy.stops > 0, "换题前确实向朗读器发了停止")
+        check(spy.stops > stopsBeforeNext, "换题前确实向朗读器发了停止")
+        check(engine.isSpeaking && spy.spoken.last?.text == engine.current?.text,
+              "换题后自动朗读新的这一句")
 
         let newText = engine.current?.text
-        engine.perform(.replayOrRead)
         check(spy.spoken.last?.text == newText && newText != first, "新题读新句，不读上一题")
         let newToken = spy.spoken.last!.token
 
@@ -2797,9 +3142,10 @@ enum SelfTest {
         engine.perform(.replayOrRead)
         check(!engine.isSpeaking && engine.speechNotice == "没有可用的英语语音",
               "无英语音色给一句可恢复提示")
-        engine.restartSession()
-        check(engine.speechNotice == nil, "换题/重来清掉朗读提示")
         spy.available = true
+        engine.restartSession()
+        check(engine.speechNotice == nil && engine.isSpeaking,
+              "换题/重来清掉旧提示并重新自动朗读")
 
         // 看答案 / 再试 / 改强度 / 重来 / 切来源 / 结束 / 退出都取消
         engine.perform(.replayOrRead)
@@ -2808,13 +3154,17 @@ enum SelfTest {
         engine.perform(.replayOrRead)
         check(spy.spoken.last?.text == engine.revealed?.text, "揭示页读的是当前英文原句")
         engine.perform(.revealOrRetry)
-        check(engine.phase == .asking && !engine.isSpeaking, "再试取消朗读")
+        check(engine.phase == .asking && engine.isSpeaking
+                  && spy.spoken.last?.text == engine.current?.text,
+              "再试取消旧朗读并自动重读这一句")
         engine.perform(.replayOrRead)
         engine.changeRatio(0.6)
         check(!engine.isSpeaking, "改填空强度取消朗读")
         engine.perform(.replayOrRead)
+        let stopsBeforeRestart = spy.stops
         engine.restartSession()
-        check(!engine.isSpeaking, "再来一遍取消朗读")
+        check(spy.stops > stopsBeforeRestart && engine.isSpeaking,
+              "再来一遍取消旧朗读并自动读新题")
 
         engine.perform(.replayOrRead)
         engine.begin(source: .mistakes, ratio: 1.0)
@@ -2825,17 +3175,16 @@ enum SelfTest {
         engine.setEnabled(true)
         engine.selectSetupSource(.bank)
         engine.perform(.primary)
-        check(engine.phase == .asking, "重新开始收藏练习")
-        engine.perform(.replayOrRead)
+        check(engine.phase == .asking && engine.isSpeaking, "重新开始收藏练习自动朗读")
         engine.stopSession()
         check(!engine.isSpeaking && engine.phase == .idle, "结束练习取消朗读")
 
         settings.practiceMode = true
         engine.begin(source: .bank, ratio: 1.0)
-        engine.perform(.replayOrRead)
+        check(engine.isSpeaking, "收藏练习再次自动朗读")
         engine.perform(.exitPractice)
         check(settings.practiceMode == false && !engine.isSpeaking,
-              "6 退出练习回歌词并取消朗读")
+              "7 退出练习回歌词并取消朗读")
 
         // 默认引擎静默：自检/快照不构造 AVSpeechSynthesizer
         let silentEngine = PracticeEngine(
@@ -2844,6 +3193,282 @@ enum SelfTest {
             mistakes: MistakeBook(url: tempURL("speech-silent-mistakes"))
         )
         check(!silentEngine.isSpeaking, "默认朗读器静默（隔离运行不发真实语音）")
+    }
+
+    // MARK: 朗读即离线练习的播放
+
+    /// 收藏/错题练习：进入时暂停音乐、每道题自动朗读，退出时按现有规则恢复音乐。
+    @MainActor
+    private static func testOfflinePracticeAutoRead() {
+        let (settings, defaults, suite) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let state = PlayerState()
+        let raw = """
+        [00:10.00]I kept the lanterns burning low
+        [00:15.00]The river carried names we never said
+        """
+        let parsed = LRCParser.parse(raw)
+        state.debugInject(
+            track: Track(title: "Paper Lanterns", artist: "The Quiet Harbor", album: "", duration: 30),
+            position: 12,
+            playing: true,
+            lines: parsed.lines,
+            translations: [:]
+        )
+
+        let attempt = MistakeAttempt(
+            source: "song", ratio: 0.6, rawInput: "zz", translation: nil, wasRetry: false,
+            blanks: [MistakeBlank(ordinal: 0, wordIndex: 0, expected: "I", actual: "z", skipped: false)]
+        )
+        let book = MistakeBook(url: tempURL("auto-read-mistakes"))
+        _ = book.record(
+            question: makeQuestion("I kept the lanterns burning low"),
+            translation: nil, attempt: attempt
+        )
+        _ = book.record(
+            question: makeQuestion("The river carried names we never said", lineTime: 17.2),
+            translation: nil, attempt: attempt
+        )
+
+        let spy = SpyMusicController()
+        let speech = SpySpeechSpeaker()
+        let engine = PracticeEngine(
+            state: state, watcher: spy, settings: settings,
+            bank: QuestionBank(url: tempURL("auto-read-bank")), mistakes: book
+        )
+        engine.installSpeechSpeaker(speech)
+
+        engine.begin(source: .mistakes, ratio: 1.0)
+        check(spy.commands == ["pause"], "进入错题练习自动暂停正在播放的音乐")
+        check(engine.isSpeaking && speech.spoken.last?.text == engine.current?.text,
+              "错题练习进入即自动朗读当前句")
+        check(engine.commandTitle(.replayOrRead) == "2 停止", "自动朗读时 2 是停止")
+        check(engine.score == 0 && engine.stats.correct == 0 && engine.stats.wrong == 0,
+              "自动朗读不写分数、不算作答")
+
+        let firstText = engine.current?.text
+        let stopsBeforeNext = speech.stops
+        engine.next()
+        check(engine.current?.text != firstText, "下一题换到另一句")
+        check(speech.spoken.last?.text == engine.current?.text, "下一题自动朗读新句")
+        check(speech.stops > stopsBeforeNext, "换题先停掉旧朗读")
+
+        engine.perform(.revealOrRetry)
+        check(engine.phase == .revealed && !engine.isSpeaking, "看答案取消朗读")
+        engine.perform(.revealOrRetry)
+        check(engine.phase == .asking && engine.isSpeaking
+                  && speech.spoken.last?.text == engine.current?.text,
+              "看答案后重试自动重读当前句")
+
+        // 自动朗读只在进入新题时触发：打字/删字不打断、也不重复发请求
+        let spokenBeforeTyping = speech.spoken.count
+        engine.typeCharacter("a", playSound: false)
+        engine.deleteBackward()
+        engine.advanceBlank()
+        check(speech.spoken.count == spokenBeforeTyping && engine.isSpeaking,
+              "输入、退格、切空都不重复触发朗读")
+
+        engine.setEnabled(false)
+        check(spy.commands.contains("play"), "退出错题练习恢复我们暂停的音乐")
+        check(!engine.isSpeaking, "退出错题练习停止朗读")
+
+        // 收藏练习同一套设计
+        let bank = QuestionBank(url: tempURL("auto-read-favorites"))
+        bank.add(text: "I kept the lanterns burning low", translation: nil,
+                 title: "Fixture", artist: "Test", lineTime: 1)
+        let bankSpy = SpyMusicController()
+        let bankSpeech = SpySpeechSpeaker()
+        let bankEngine = PracticeEngine(
+            state: state, watcher: bankSpy, settings: settings,
+            bank: bank, mistakes: MistakeBook(url: tempURL("auto-read-favorites-mistakes"))
+        )
+        bankEngine.installSpeechSpeaker(bankSpeech)
+        bankEngine.begin(source: .bank, ratio: 1.0)
+        check(bankSpy.commands == ["pause"], "进入收藏练习同样自动暂停音乐")
+        check(bankEngine.isSpeaking && bankSpeech.spoken.last?.text == bankEngine.current?.text,
+              "收藏练习进入即自动朗读")
+        bankEngine.perform(.replayOrRead)
+        check(!bankEngine.isSpeaking, "朗读中按 2 停止，音乐不会被误恢复")
+        check(bankSpy.commands == ["pause"], "停止朗读不再额外下发播放命令")
+        bankEngine.setEnabled(false)
+        check(bankSpy.commands.contains("play"), "退出收藏练习恢复音乐")
+
+        // 进入时音乐本来就没在播放：不发任何命令，也不在退出时擅自播放
+        let pausedState = PlayerState()
+        pausedState.debugInject(
+            track: Track(title: "Paper Lanterns", artist: "The Quiet Harbor", album: "", duration: 30),
+            position: 12, playing: false, lines: parsed.lines, translations: [:]
+        )
+        let quietSpy = SpyMusicController()
+        let quietEngine = PracticeEngine(
+            state: pausedState, watcher: quietSpy, settings: settings,
+            bank: bank, mistakes: MistakeBook(url: tempURL("auto-read-quiet-mistakes"))
+        )
+        quietEngine.begin(source: .bank, ratio: 1.0)
+        quietEngine.setEnabled(false)
+        check(!quietSpy.didControl, "音乐本来暂停：不暂停、退出也不擅自播放")
+    }
+
+    // MARK: 歌曲练习的清晰朗读
+
+    /// 听不清歌曲时用 7 换成清晰的本地朗读：音乐先停，之后仍可用 1 重听。
+    @MainActor
+    private static func testSongReadingFallback() {
+        let (settings, defaults, suite) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let state = PlayerState()
+        let raw = """
+        [00:10.00]I kept the lanterns burning low
+        [00:15.00]The river carried names we never said
+        """
+        let parsed = LRCParser.parse(raw)
+        state.debugInject(
+            track: Track(title: "Paper Lanterns", artist: "The Quiet Harbor", album: "", duration: 30),
+            position: 10.2,
+            playing: true,
+            lines: parsed.lines,
+            translations: [:]
+        )
+
+        let spy = SpyMusicController()
+        let speech = SpySpeechSpeaker()
+        let bank = QuestionBank(url: tempURL("song-read-bank"))
+        bank.add(text: "I kept the lanterns burning low", translation: nil,
+                 title: "Fixture", artist: "Test", lineTime: 1)
+        let engine = PracticeEngine(
+            state: state, watcher: spy, settings: settings,
+            bank: bank, mistakes: MistakeBook(url: tempURL("song-read-mistakes"))
+        )
+        engine.installSpeechSpeaker(speech)
+
+        engine.begin(source: .song, ratio: 1.0)
+        check(engine.phase == .listening, "歌曲练习从收听开始")
+        check(speech.spoken.isEmpty, "歌曲练习不自动朗读，先听音乐")
+        check(engine.commandTitle(.readAloud) == "8 朗读", "歌曲收听中提供 8 朗读")
+        check(engine.commandTitle(.replayOrRead) == "2 重听", "歌曲收听中 2 是重听")
+        check(spy.seeks.last?.play == true, "歌曲练习先播放音乐")
+
+        let lineText = engine.current?.text
+        engine.perform(.readAloud)
+        check(engine.phase == .asking && engine.isSpeaking,
+              "听不清时按 7：停住音乐、改为清晰朗读并进入答题")
+        check(speech.spoken.last?.text == lineText, "朗读的是当前这一句")
+        check(spy.commands.contains("pause"), "朗读前暂停音乐，避免两路声音叠在一起")
+        check(spy.seeks.last?.play == false, "朗读前回到当前句句首锚点")
+        check(engine.commandTitle(.readAloud) == "8 停止", "朗读中 8 是停止")
+        check(engine.commandTitle(.replayOrRead) == "2 重听", "朗读中仍可 2 重听音乐")
+        check(!engine.blankIndices.isEmpty, "朗读后仍可直接填写")
+
+        engine.perform(.readAloud)
+        check(!engine.isSpeaking && engine.phase == .asking, "再按 7 停止朗读，不叠音")
+
+        engine.perform(.readAloud)
+        engine.perform(.replayOrRead)
+        check(!engine.isSpeaking, "按 2 重听会先停掉朗读")
+        check(spy.seeks.last?.play == true, "2 重听重新播放音乐")
+        check(engine.phase == .listening, "重听回到收听态")
+
+        engine.perform(.readAloud)
+        engine.perform(.revealOrRetry)
+        check(engine.phase == .revealed, "看答案进入揭示")
+        check(engine.commandTitle(.readAloud) == "8 朗读", "揭示页也提供清晰朗读")
+        engine.perform(.readAloud)
+        check(speech.spoken.last?.text == engine.revealed?.text, "揭示页朗读的是答案原句")
+        engine.perform(.primary)
+        check(engine.phase == .listening && !engine.isSpeaking, "下一句回到音乐并停止朗读")
+
+        engine.setEnabled(false)
+
+        // 收藏/错题不需要 7：1 就是朗读
+        let offline = PracticeEngine(
+            state: PlayerState(), watcher: SpyMusicController(), settings: settings,
+            bank: bank, mistakes: MistakeBook(url: tempURL("song-read-offline-mistakes"))
+        )
+        offline.begin(source: .bank, ratio: 1.0)
+        check(offline.commandTitle(.readAloud) == nil, "收藏/错题只用 2 朗读，不显示 8")
+        offline.setEnabled(false)
+    }
+
+    // MARK: 进入收藏与错题管理窗口
+
+    /// 打开管理窗口时暂停音乐，关闭时恢复；从窗口开始练习则把暂停交给练习会话。
+    @MainActor
+    private static func testLibraryReviewPause() {
+        let (settings, defaults, suite) = makeSettings()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let state = PlayerState()
+        let parsed = LRCParser.parse("""
+        [00:10.00]I kept the lanterns burning low
+        [00:15.00]The river carried names we never said
+        """)
+        let track = Track(title: "Paper Lanterns", artist: "The Quiet Harbor", album: "", duration: 30)
+        state.debugInject(track: track, position: 12, playing: true,
+                          lines: parsed.lines, translations: [:])
+
+        let bank = QuestionBank(url: tempURL("review-bank"))
+        bank.add(text: "I kept the lanterns burning low", translation: nil,
+                 title: "Fixture", artist: "Test", lineTime: 1)
+        let spy = SpyMusicController()
+        let engine = PracticeEngine(
+            state: state, watcher: spy, settings: settings, bank: bank,
+            mistakes: MistakeBook(url: tempURL("review-mistakes"))
+        )
+
+        engine.beginLibraryReview()
+        check(spy.commands == ["pause"], "进入收藏与错题窗口暂停正在播放的音乐")
+        engine.beginLibraryReview()
+        check(spy.commands == ["pause"], "窗口已经打开时不重复暂停")
+        engine.endLibraryReview()
+        check(spy.commands == ["pause", "play"], "关闭管理窗口恢复音乐")
+        engine.endLibraryReview()
+        check(spy.commands == ["pause", "play"], "重复关闭不重复恢复")
+
+        // 从窗口开始练习：暂停交给练习会话，关窗不会再恢复一下
+        state.debugSetPlayback(position: 12, playing: true)
+        engine.beginLibraryReview()
+        check(spy.commands.last == "pause", "再次进入窗口重新暂停")
+        let commandsBeforePractice = spy.commands
+        // 采样已经看到暂停（真实运行里 400ms 内就会更新）
+        state.debugSetPlayback(position: 12, playing: false)
+        engine.begin(source: .bank, ratio: 1.0)
+        engine.endLibraryReview()
+        check(spy.commands == commandsBeforePractice,
+              "从窗口开始练习后关窗，不会把音乐恢复一下再暂停")
+        check(engine.phase == .asking, "从窗口开始收藏练习")
+        engine.setEnabled(false)
+        check(spy.commands.last == "play", "退出练习恢复管理窗口/练习暂停的音乐")
+
+        // 音乐本来暂停：打开、关闭窗口都不发命令
+        let pausedState = PlayerState()
+        pausedState.debugInject(track: track, position: 12, playing: false,
+                                lines: parsed.lines, translations: [:])
+        let quietSpy = SpyMusicController()
+        let quietEngine = PracticeEngine(
+            state: pausedState, watcher: quietSpy, settings: settings,
+            bank: bank, mistakes: MistakeBook(url: tempURL("review-quiet-mistakes"))
+        )
+        quietEngine.beginLibraryReview()
+        quietEngine.endLibraryReview()
+        check(!quietSpy.didControl, "音乐本来暂停：管理窗口不发任何播放命令")
+
+        // 练习进行中打开管理窗口：不能抢停正在按句播放的音乐
+        let songState = PlayerState()
+        songState.debugInject(track: track, position: 10, playing: true,
+                              lines: parsed.lines, translations: [:])
+        let songSpy = SpyMusicController()
+        let songEngine = PracticeEngine(
+            state: songState, watcher: songSpy, settings: settings, bank: bank,
+            mistakes: MistakeBook(url: tempURL("review-song-mistakes"))
+        )
+        songEngine.begin(source: .song, ratio: 1.0)
+        let commandsBeforeReview = songSpy.commands
+        songEngine.beginLibraryReview()
+        check(songSpy.commands == commandsBeforeReview,
+              "练习进行中打开管理窗口不会抢停音乐")
+        songEngine.setEnabled(false)
     }
 
     // MARK: 窗口拖拽与背景透明度

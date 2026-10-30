@@ -12,6 +12,17 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     MainActor.assumeIsolated { SnapshotTool.render(to: CommandLine.arguments[i + 1]) }
 }
 
+// 键盘菜单：1 打开后的第一页，数字索引与当前值一眼可见
+if let i = CommandLine.arguments.firstIndex(of: "--snapshot-menu"),
+   CommandLine.arguments.count > i + 1 {
+    MainActor.assumeIsolated {
+        SnapshotTool.render(
+            to: CommandLine.arguments[i + 1],
+            width: 620, height: 440, menu: true
+        )
+    }
+}
+
 if let i = CommandLine.arguments.firstIndex(of: "--snapshot-full"),
    CommandLine.arguments.count > i + 1 {
     MainActor.assumeIsolated {
@@ -124,7 +135,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot-practice-small-answe
     }
 }
 
-// 最小窗设置页：固定底部「3 开始 / 6 返回」不被内容推走
+// 最小窗设置页：固定底部「1 菜单 / 4 开始 / 7 返回」不被内容推走
 if let i = CommandLine.arguments.firstIndex(of: "--snapshot-practice-setup-small"),
    CommandLine.arguments.count > i + 1 {
     MainActor.assumeIsolated {
@@ -137,7 +148,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot-practice-setup-small
     }
 }
 
-// 最小窗离线练习：数字 1 朗读与底部操作在 480×380 下仍可见
+// 最小窗离线练习：数字 2 朗读与底部操作在 480×380 下仍可见
 if let i = CommandLine.arguments.firstIndex(of: "--snapshot-practice-bank-small"),
    CommandLine.arguments.count > i + 1 {
     MainActor.assumeIsolated {

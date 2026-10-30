@@ -319,6 +319,8 @@ final class PracticeEngine: ObservableObject {
     /// 下发 seek(play:true) 不代表暂停，所以绝不能在这里置位——
     /// 否则用户手动暂停后离开练习，会被我们擅自恢复播放。
     private var pausedByUs = false
+    /// 「收藏与错题」管理窗口暂停了音乐；关闭窗口或开始练习时交给 `pausedByUs`。
+    private var pausedForReview = false
     private var lastTrackKey: String?
     private var lastGeneration = -1
     /// 采样消失（歌播完了 / Music 退出）的起点
@@ -436,6 +438,24 @@ final class PracticeEngine: ObservableObject {
         setupSource = value
     }
 
+    /// 设置页的 2 / 3 键：按预设档位逐档增减填写比例，两端停住。
+    /// 只作用于设置页，答题中改比例仍走 `changeRatio`（会重挖当前句）。
+    func adjustSetupRatio(by steps: Int) {
+        guard phase == .setup, steps != 0 else { return }
+        let choices = Settings.practiceRatioChoices
+        var value = settings.practiceRatio
+        for _ in 0..<abs(steps) {
+            let candidate = steps > 0
+                ? choices.first(where: { $0 > value + 0.001 })
+                : choices.last(where: { $0 < value - 0.001 })
+            guard let candidate else { break }
+            value = candidate
+        }
+        guard abs(value - settings.practiceRatio) > 0.0001 else { return }
+        settings.practiceRatio = value
+        Diag.log("practice: setup ratio \(Int(value * 100))%")
+    }
+
     /// 进入设置页时给一个有内容的默认来源：歌曲 → 收藏 → 错题
     private func chooseDefaultSetupSource() {
         if canUseSource(.song) {
@@ -449,10 +469,11 @@ final class PracticeEngine: ObservableObject {
 
     // MARK: 本地朗读
 
-    /// 只有离线来源（收藏/错题）的答题与揭示页可以朗读。
-    /// 歌曲练习保留原来的「重听」逻辑，不在这里同时出声。
+    /// 所有来源的答题与揭示页都可以朗读。
+    ///
+    /// - 收藏/错题：朗读就是这两类练习的「播放」，进入题目时自动开始；
+    /// - 歌曲：音乐仍在按句播放，用户听不清时可以用 7 换成清晰的本地朗读。
     var canReadAloud: Bool {
-        guard source == .bank || source == .mistakes else { return false }
         switch phase {
         case .asking, .listening: return current != nil
         case .revealed: return revealed != nil
@@ -468,25 +489,96 @@ final class PracticeEngine: ObservableObject {
     }
 
     var isSpeaking: Bool { speech.isSpeaking }
+
     var speechNotice: String? { speech.notice }
 
+    /// 朗读归属的那道题
+    private var readingLineID: UUID? {
+        phase == .revealed ? revealed?.id : current?.id
+    }
+
     /// 朗读 / 停止当前英文原句。重复点击不叠音；无英语音色时给一句可恢复提示。
+    ///
+    /// 歌曲来源里朗读是「听不清时的清晰替代」：开始朗读前先按句末同样的方式
+    /// 把音乐停住（回到句首锚点），朗读和音乐不会同时出声；
+    /// 想再听音乐按 2 重听即可。
     func toggleReadAloud() {
         guard canReadAloud, let text = readAloudText, !text.isEmpty else { return }
-        let lineID = (phase == .revealed ? revealed?.id : current?.id)
-        guard let lineID else { return }
-        speech.toggle(text: text, lineID: lineID)
+        guard let lineID = readingLineID else { return }
+
+        // 再按一次是停止：不改变播放状态
+        if isSpeaking, speech.lineID == lineID {
+            speech.cancel()
+            return
+        }
+
+        silenceMusicForReading()
+        speech.read(text, lineID: lineID)
+        if source == .song, phase == .asking {
+            requestInputFocus()
+        }
     }
 
     /// 换题/重试/切来源/结束练习/退出练习/隐藏窗口时停掉旧句
     func stopReading() { speech.cancel() }
+
+    /// 界面在阶段/题目/来源变化时调用：只停「不属于当前题」的旧朗读。
+    ///
+    /// 自动朗读是在新题成为当前题之后才开始的，不能被同一轮界面刷新
+    /// 当成「上一句残留」停掉；真正换题、揭示、结束仍然由引擎里显式的
+    /// `stopReading()` 负责。
+    func stopStaleReading() {
+        guard let lineID = speech.lineID else { return }
+        guard let currentID = readingLineID, lineID == currentID else {
+            speech.cancel()
+            return
+        }
+    }
 
     /// 正常 App 注入 Apple 原生朗读；自检/快照保持默认静默
     func installSpeechSpeaker(_ speaker: SpeechSpeaking) {
         speech.install(speaker)
     }
 
-    // MARK: 数字命令 1…6
+    /// 收藏/错题：每进入一道新题自动朗读一次。
+    ///
+    /// 朗读在这两种练习里等价于「音乐播放」，所以进入练习、下一题、看答案后重试
+    /// 都先自动读一遍；歌曲来源仍由音乐负责，不自动朗读，避免两路声音叠在一起。
+    private func autoReadIfNeeded() {
+        guard source == .bank || source == .mistakes else { return }
+        guard phase == .asking else { return }
+        guard let lineID = current?.id, let text = readAloudText, !text.isEmpty else { return }
+        guard !isSpeaking else { return }
+        speech.read(text, lineID: lineID)
+    }
+
+    /// 歌曲来源开始朗读前把音乐停住：只要音乐确实在放，就暂停并回到这一句的句首，
+    /// 之后按 2 重听从同一个锚点继续。没有可信的「正在播放」采样时不发命令，
+    /// 只把这一句当成已听完，交给已有的播放异常逻辑。
+    private func silenceMusicForReading() {
+        guard source == .song else { return }
+        missingSince = nil
+        pausedSince = nil
+        pendingAutoAdvance = false
+
+        if state.snapshot?.playing == true {
+            pausedByUs = true
+            watcher.send(.pause)
+            if let start = current?.start {
+                watcher.seek(to: start, play: false)
+            }
+            lastCommandAt = clock()
+        }
+
+        if phase == .listening {
+            // 朗读期间不再等句末：用户已经用清晰语音代替了这一遍播放
+            phase = .asking
+            requestInputFocus()
+            Diag.log("practice: reading replaces music at line \(cursor + 1)")
+        }
+    }
+
+    // MARK: 数字命令（1 是菜单，2…8 是练习动作）
 
     /// 当前阶段该数字动作的按钮标题；nil = 阶段不适用（按键仍会被消费）。
     /// 可见按钮与键盘共用这一份判定，避免标签/事件不一致。
@@ -496,40 +588,45 @@ final class PracticeEngine: ObservableObject {
             if isSongMode {
                 guard phase == .asking || phase == .listening, showsRetryInActionBar,
                       current?.start != nil else { return nil }
-                return "1 重听"
+                return "2 重听"
             }
             guard canReadAloud else { return nil }
-            return isSpeaking ? "1 停止" : "1 朗读"
+            return isSpeaking ? "2 停止" : "2 朗读"
+
+        case .readAloud:
+            // 收藏/错题由 2 负责朗读；8 只在歌曲练习里补一个「清晰朗读」入口
+            guard isSongMode, canReadAloud else { return nil }
+            return isSpeaking ? "8 停止" : "8 朗读"
 
         case .revealOrRetry:
-            if phase == .asking { return "2 看答案" }
-            if phase == .revealed { return "2 再试" }
+            if phase == .asking { return "3 看答案" }
+            if phase == .revealed { return "3 再试" }
             return nil
 
         case .primary:
             switch phase {
             case .setup:
-                return canUseSource(setupSource) ? "3 开始" : nil
+                return canUseSource(setupSource) ? "4 开始" : nil
             case .asking:
-                // 提交只走回车；答题阶段不再显示数字 3 的提交按钮
+                // 提交只走回车；答题阶段不再显示数字 4 的提交按钮
                 return nil
             case .revealed:
-                return "3 下一句"
+                return "4 下一句"
             case .idle:
-                return stats.correct + stats.wrong > 0 ? "3 再来一遍" : nil
+                return stats.correct + stats.wrong > 0 ? "4 再来一遍" : nil
             case .listening:
                 // 收听中不提前强制提交，时序仍由音乐句末决定
                 return nil
             }
 
         case .skip:
-            return (phase == .asking || phase == .listening) ? "4 跳过" : nil
+            return (phase == .asking || phase == .listening) ? "5 跳过" : nil
 
         case .backToSetup:
-            return phase == .setup ? nil : "5 设置"
+            return phase == .setup ? nil : "6 设置"
 
         case .exitPractice:
-            return "6 返回"
+            return "7 返回"
         }
     }
 
@@ -543,6 +640,8 @@ final class PracticeEngine: ObservableObject {
             } else {
                 toggleReadAloud()
             }
+        case .readAloud:
+            toggleReadAloud()
         case .revealOrRetry:
             if phase == .asking {
                 giveUp()
@@ -909,8 +1008,14 @@ final class PracticeEngine: ObservableObject {
         enabled = false
         phase = .setup
         resetStats()
-        chooseDefaultSetupSource()
-        Diag.log("practice: back to setup")
+        // 设置页不再提供来源选择：从收藏/错题会话回来时保留当前来源，
+        // 否则调完比例再开始会悄悄换成默认来源（通常是当前歌曲）。
+        if canUseSource(source) {
+            setupSource = source
+        } else {
+            chooseDefaultSetupSource()
+        }
+        Diag.log("practice: back to setup source=\(setupSource.rawValue)")
     }
 
     private func resetStats() {
@@ -920,15 +1025,42 @@ final class PracticeEngine: ObservableObject {
         wrongQuestionIDs = []
     }
 
+    /// 打开「收藏与错题」管理窗口时暂停音乐：回看歌词/错题时不该有音乐盖着。
+    /// 进入练习会把这次暂停交给练习会话，练习退出时再恢复；关闭窗口时若没进练习，
+    /// 直接把音乐还回去。收听中的歌曲不能被抢停——那会被当成用户手动暂停。
+    func beginLibraryReview() {
+        guard phase != .listening, !pausedForReview, state.snapshot?.playing == true else { return }
+        watcher.send(.pause)
+        pausedForReview = true
+        Diag.log("library: paused music for review")
+    }
+
+    /// 关闭管理窗口：练习没接手就把音乐恢复
+    func endLibraryReview() {
+        guard pausedForReview else { return }
+        pausedForReview = false
+        watcher.send(.play)
+        Diag.log("library: resumed music after review")
+    }
+
     /// 从设置页 / 菜单 / 管理窗口开始一次练习。
     /// - Parameter onlyID: 只练收藏/错题里的某一条；nil 表示练整个库。
     func begin(source: Source, ratio: Double, onlyID: UUID? = nil) {
-        // 切换来源前先彻底结束旧会话：停止计时、取消自动下一题、恢复被我们暂停的音乐
+        // 切换来源前先彻底结束旧会话：停止计时、取消自动下一题；
+        // 切回歌曲来源时再把我们之前暂停的音乐恢复。
         stopReading()
         stopTick()
         autoTask?.cancel()
         autoTask = nil
-        if pausedByUs {
+        // 管理窗口暂停的音乐由本次练习接手：离线练习继续停着，歌曲练习会重新播放，
+        // 两种情况下退出练习都由 pausedByUs 负责恢复。
+        if pausedForReview {
+            pausedForReview = false
+            pausedByUs = true
+        }
+        // 切到离线练习（收藏/错题）时保留「我们按下的暂停」：新会话同样要用朗读，
+        // 不需要先恢复再暂停，避免音乐短暂冒一声。
+        if pausedByUs, source == .song {
             watcher.send(.play)
             pausedByUs = false
         }
@@ -960,10 +1092,22 @@ final class PracticeEngine: ObservableObject {
             startTick()
             loadSong(fromBeginning: true)
         case .bank:
+            pauseMusicForOfflinePractice()
             loadBank(onlyID: onlyID)
         case .mistakes:
+            pauseMusicForOfflinePractice()
             loadMistakes(onlyID: onlyID)
         }
+    }
+
+    /// 收藏/错题练习的音频是本地朗读，不是音乐：进入时先把音乐停下，
+    /// 避免两路声音互相干扰。只有确实「正在播放」时才发命令；
+    /// 退出练习时按 `pausedByUs` 的既有规则恢复。
+    private func pauseMusicForOfflinePractice() {
+        guard state.snapshot?.playing == true else { return }
+        watcher.send(.pause)
+        pausedByUs = true
+        Diag.log("practice: paused music for offline practice")
     }
 
     private func endSession() {
@@ -1096,6 +1240,7 @@ final class PracticeEngine: ObservableObject {
         setCurrent(0)
         phase = .asking
         requestInputFocus()
+        autoReadIfNeeded()
         Diag.log("practice: favorites session \(questions.count) 句")
     }
 
@@ -1139,6 +1284,7 @@ final class PracticeEngine: ObservableObject {
         setCurrent(0)
         phase = .asking
         requestInputFocus()
+        autoReadIfNeeded()
         Diag.log("practice: mistakes session \(questions.count) 条")
     }
 
@@ -1687,6 +1833,8 @@ final class PracticeEngine: ObservableObject {
             Diag.log("practice: retry line \(cursor + 1) offline")
         }
         requestInputFocus()
+        // 歌曲来源在重试时重新播放音乐；收藏/错题以朗读为「播放」，同样重读一遍
+        autoReadIfNeeded()
     }
 
     func next() {
@@ -1700,6 +1848,7 @@ final class PracticeEngine: ObservableObject {
             setCurrent(cursor)
             phase = .asking
             requestInputFocus()
+            autoReadIfNeeded()
         }
     }
 
@@ -1727,6 +1876,8 @@ final class PracticeEngine: ObservableObject {
 
     /// 练习中改强度：当前这句立刻按新强度重挖，输入清空
     func changeRatio(_ ratio: Double) {
+        // 选中当前这一档不重挖：否则会白白清掉已经填的内容
+        guard abs(settings.practiceRatio - ratio) > 0.001 else { return }
         stopReading()
         settings.practiceRatio = ratio
         guard let question = current else { return }

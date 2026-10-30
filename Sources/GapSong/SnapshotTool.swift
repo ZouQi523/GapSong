@@ -2,6 +2,10 @@ import SwiftUI
 import AppKit
 
 enum SnapshotTool {
+    /// 快照进程一次只渲染一张图：共用一个不打开的菜单实例即可
+    @MainActor
+    private static let sharedMenu = CommandMenu()
+
     @MainActor
     static func render(
         to path: String,
@@ -18,7 +22,8 @@ enum SnapshotTool {
         mistakePractice: Bool = false,
         issue: PlaybackIssue? = nil,
         storageWarning: Bool = false,
-        libraryConfirmDelete: Bool = false
+        libraryConfirmDelete: Bool = false,
+        menu: Bool = false
     ) -> Never {
         setvbuf(stdout, nil, _IONBF, 0)
         let settings = Settings()
@@ -60,10 +65,14 @@ enum SnapshotTool {
             bank: bank,
             mistakes: mistakes
         )
-        // 快照绝不发真实语音：显式保持静默朗读器（数字 1 的标签仍可核对）
+        // 快照绝不发真实语音：显式保持静默朗读器（数字 2/8 的标签仍可核对）
         engine.installSpeechSpeaker(SilentSpeechSpeaker())
 
-        if let library {
+        if menu {
+            renderCommandMenu(state: state, settings: settings, engine: engine,
+                              bank: bank, mistakes: mistakes,
+                              path: path, width: width, height: height)
+        } else if let library {
             renderLibrary(bank: bank, mistakes: mistakes, tab: library,
                           path: path, width: width, height: height,
                           confirmDelete: libraryConfirmDelete)
@@ -127,7 +136,8 @@ enum SnapshotTool {
             translator: state.translator,
             practice: engine,
             bank: bank,
-            mistakes: mistakes
+            mistakes: mistakes,
+            menu: sharedMenu
         )
         .environment(\.lyricPreview, true)
         .frame(width: width, height: height)
@@ -202,6 +212,7 @@ enum SnapshotTool {
             practice: engine,
             bank: bank,
             mistakes: mistakes,
+            menu: sharedMenu,
             previewSelectedWord: answer ? "lanterns" : nil
         )
         .environment(\.lyricPreview, true)
@@ -265,7 +276,8 @@ enum SnapshotTool {
             translator: state.translator,
             practice: engine,
             bank: bank,
-            mistakes: mistakes
+            mistakes: mistakes,
+            menu: sharedMenu
         )
         .environment(\.lyricPreview, true)
         .environment(\.practicePreview, true)
@@ -336,7 +348,8 @@ enum SnapshotTool {
             translator: state.translator,
             practice: engine,
             bank: bank,
-            mistakes: mistakes
+            mistakes: mistakes,
+            menu: sharedMenu
         )
         .environment(\.lyricPreview, true)
         .environment(\.practicePreview, true)
@@ -494,13 +507,83 @@ enum SnapshotTool {
             translator: state.translator,
             practice: engine,
             bank: bank,
-            mistakes: mistakes
+            mistakes: mistakes,
+            menu: sharedMenu
         )
         .environment(\.lyricPreview, true)
         .environment(\.practicePreview, true)
         .frame(width: width, height: height)
 
         writeHosted(view, width: width, height: height, to: path)
+    }
+
+    // MARK: 键盘菜单
+
+    @MainActor
+    private static func renderCommandMenu(
+        state: PlayerState,
+        settings: Settings,
+        engine: PracticeEngine,
+        bank: QuestionBank,
+        mistakes: MistakeBook,
+        path: String,
+        width: CGFloat,
+        height: CGFloat
+    ) -> Never {
+        let song = DemoFixtures.paperLanterns
+        state.debugInject(
+            track: song.track,
+            position: 33.5,
+            playing: true,
+            lines: song.lines,
+            translations: song.translations
+        )
+        settings.showTranslation = true
+        settings.practiceRatio = 0.6
+
+        let menu = CommandMenu()
+        menu.rootProvider = {
+            var context = CommandMenuContext()
+            context.lyricsVisible = settings.visible
+            context.showTranslation = settings.showTranslation
+            context.practiceMode = false
+            context.songLineCount = engine.songPracticeLineCount
+            context.bankCount = 4
+            context.mistakeCount = 3
+            context.ratio = settings.practiceRatio
+            context.tail = settings.practiceTail
+            context.typingSound = settings.typingSound
+            context.locked = settings.locked
+            context.transparency = settings.backgroundTransparency
+            context.fontSize = settings.fontSize
+            context.fullMode = settings.forceFull
+            context.languageID = settings.targetLanguageID
+            context.panelWidth = Double(width)
+            context.panelHeight = Double(height)
+            context.lyricSource = state.lyrics?.source
+            return CommandMenuCatalog.root(context)
+        }
+        menu.open()
+        // 调试用：--snapshot-menu-select 2 打开子页，可连续用逗号下钻
+        if let raw = argumentValue("--snapshot-menu-select") {
+            for part in raw.split(separator: ",") {
+                if let digit = Int(part) { menu.select(digit) }
+            }
+        }
+
+        let view = OverlayView(
+            state: state,
+            settings: settings,
+            translator: state.translator,
+            practice: engine,
+            bank: bank,
+            mistakes: mistakes,
+            menu: menu
+        )
+        .environment(\.lyricPreview, true)
+        .frame(width: width, height: height)
+
+        write(view, to: path)
     }
 
     // MARK: 输出

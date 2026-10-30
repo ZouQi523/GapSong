@@ -28,6 +28,8 @@ final class OverlayController {
 
     private var cancellables: Set<AnyCancellable> = []
     private var isApplyingSize = false
+    /// 菜单打开前的窗口 frame：菜单需要临时加高，关掉后连位置一起还原
+    private var menuRestoreFrame: NSRect?
 
     /// 练习态需要能放下设置页/答题/揭示/结束四套内容，歌词态保持紧凑 420×110
     static func minSize(practice: Bool) -> NSSize {
@@ -36,6 +38,9 @@ final class OverlayController {
             : NSSize(width: Settings.lyricMinSize.width, height: Settings.lyricMinSize.height)
     }
 
+    /// 菜单至少需要的高度：标题 + 9 行 + 底部提示
+    static let menuMinSize = NSSize(width: 600, height: 440)
+
     private var currentMinSize: NSSize { Self.minSize(practice: settings.practiceMode) }
 
     init(
@@ -43,7 +48,8 @@ final class OverlayController {
         settings: Settings,
         practice: PracticeEngine,
         bank: QuestionBank,
-        mistakes: MistakeBook
+        mistakes: MistakeBook,
+        menu: CommandMenu
     ) {
         self.state = state
         self.settings = settings
@@ -54,7 +60,8 @@ final class OverlayController {
                 translator: state.translator,
                 practice: practice,
                 bank: bank,
-                mistakes: mistakes
+                mistakes: mistakes,
+                menu: menu
             )
         )
 
@@ -70,13 +77,17 @@ final class OverlayController {
             backing: .buffered,
             defer: false
         )
-        panel.level = .floating
+        // 普通窗口层级：不压住其它应用的窗口，需要时由用户或系统正常前置
+        panel.level = .normal
+        // 显式禁用浮动面板行为，保持普通窗口排序
+        panel.isFloatingPanel = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.animationBehavior = .utilityWindow
+        // 保留已有桌面空间行为，窗口层级仍使用 .normal
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.minSize = minSize
         panel.isReleasedWhenClosed = false
@@ -130,7 +141,9 @@ final class OverlayController {
 
     func hide() { panel.orderOut(nil) }
 
+    /// 幂等：可见性没有变化时不动窗口，避免每次偏好更新都把已显示的窗口重新提到最前
     func setVisible(_ v: Bool) {
+        guard v != panel.isVisible else { return }
         v ? show() : hide()
     }
 
@@ -141,16 +154,71 @@ final class OverlayController {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// 键盘菜单需要更多横向/纵向空间，打开时临时放大、关闭时还原。
+    ///
+    /// 只改运行时 frame，不写 `settings.panelWidth/Height`：
+    /// 菜单不是用户调整的窗口尺寸，不该覆盖记住的歌词/练习尺寸。
+    func setMenuLayout(_ open: Bool) {
+        if open {
+            guard menuRestoreFrame == nil else { return }
+            menuRestoreFrame = panel.frame
+            // 菜单期间不要因为背景拖动而移动窗口：关闭时位置要原样还回去
+            panel.isMovableByWindowBackground = false
+            let target = NSSize(
+                width: max(panel.frame.width, Self.menuMinSize.width),
+                height: max(panel.frame.height, Self.menuMinSize.height)
+            )
+            applyRuntimeSize(target)
+        } else if let restore = menuRestoreFrame {
+            menuRestoreFrame = nil
+            let minSize = currentMinSize
+            var frame = restore
+            frame.size = NSSize(
+                width: max(restore.width, minSize.width),
+                height: max(restore.height, minSize.height)
+            )
+            applyRuntimeFrame(frame)
+            panel.isMovableByWindowBackground = !settings.locked
+        }
+    }
+
+    /// 菜单打开的入口：键盘和「1 菜单」按钮都走这里
+    func focusForMenu() {
+        focusForKeyInput()
+    }
+
     // MARK: 私有
 
+    /// 只动当前 frame，保持顶部位置不变，并夹在屏幕可见范围内
+    private func applyRuntimeSize(_ size: NSSize) {
+        var frame = panel.frame
+        frame.origin.y = frame.maxY - size.height
+        frame.size = size
+        applyRuntimeFrame(frame)
+    }
+
+    private func applyRuntimeFrame(_ frame: NSRect) {
+        var frame = frame
+        if let screen = panel.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            frame.origin.x = min(max(frame.origin.x, visible.minX - 20), visible.maxX - frame.width + 20)
+            frame.origin.y = min(max(frame.origin.y, visible.minY - 20), visible.maxY - frame.height + 20)
+        }
+        panel.setFrame(frame, display: true, animate: false)
+        hosting.frame = NSRect(origin: .zero, size: frame.size)
+    }
+
     private func applySettings() {
-        panel.isMovableByWindowBackground = !settings.locked
+        // 菜单打开期间保持不可拖动，关闭时 setMenuLayout 会按锁定偏好恢复
+        panel.isMovableByWindowBackground = menuRestoreFrame == nil && !settings.locked
         panel.minSize = currentMinSize
         applySize()
         setVisible(settings.visible)
     }
 
     private func applySize() {
+        // 菜单打开期间不改用户尺寸；关闭时 setMenuLayout 会还原
+        guard menuRestoreFrame == nil else { return }
         let minSize = currentMinSize
         let target = NSSize(
             width: max(minSize.width, settings.panelWidth),
@@ -193,7 +261,8 @@ final class OverlayController {
     }
 
     private func saveSize() {
-        guard !isApplyingSize else { return }
+        // 菜单临时加大的尺寸不写回偏好
+        guard !isApplyingSize, menuRestoreFrame == nil else { return }
         settings.setSize(width: panel.frame.width, height: panel.frame.height)
     }
 }

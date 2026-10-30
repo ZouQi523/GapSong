@@ -168,13 +168,10 @@ final class SpeechReader {
         onChange?()
     }
 
-    /// 朗读/停止同一句：再点一次就是停，不会叠音。
-    func toggle(text: String, lineID: UUID) {
-        if isSpeaking, self.lineID == lineID {
-            cancel()
-            return
-        }
-
+    /// 无条件开始朗读这一句：换题自动朗读和用户点「朗读/停止」都走这里。
+    /// 已经在读同一句时也会重新开始从句首读，但不会叠音——
+    /// 新请求先让旧句失效并显式停掉。
+    func read(_ text: String, lineID: UUID) {
         invalidateCurrent()
         speaker.stop()
         notice = nil

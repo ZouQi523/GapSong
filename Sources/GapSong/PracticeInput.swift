@@ -134,7 +134,7 @@ final class PracticeInputTextView: NSTextView {
                 engine?.primaryAction()
                 return
             }
-            // 数字键在练习窗是功能键（1…6），不作为真实答案输入；
+            // 数字键在练习窗是功能键（1 打开菜单、2…8 是练习动作），不作为真实答案输入；
             // 这里只接字母/连字符/撇号。整句粘贴仍走下面的批量入口。
             if ch.isASCII, ch.isLetter || ch == "-" || ch == "'" {
                 engine?.typeCharacter(ch)

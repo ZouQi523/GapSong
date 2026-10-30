@@ -667,9 +667,11 @@ private struct MistakeRow: View {
 
 /// 管理窗口：一个独立、轻量的 NSPanel，不改动歌词窗本身
 @MainActor
-final class LibraryWindowController: NSWindowController {
+final class LibraryWindowController: NSWindowController, NSWindowDelegate {
     private let model: LibraryModel
     private let windowRef: NSWindow
+    /// 窗口关闭时通知（用于把为回看暂停的音乐恢复或交给练习）
+    private let onWindowClose: () -> Void
 
     init(
         favorites: QuestionBank,
@@ -681,10 +683,12 @@ final class LibraryWindowController: NSWindowController {
         onPracticeAllMistakes: @escaping () -> Void,
         onClearFavorites: @escaping () -> Void,
         onClearMistakes: @escaping () -> Void,
-        confirmDelete: @escaping (String, String) -> Bool
+        confirmDelete: @escaping (String, String) -> Bool,
+        onWindowClose: @escaping () -> Void
     ) {
         let model = LibraryModel(tab: initialTab, confirmDelete: confirmDelete)
         self.model = model
+        self.onWindowClose = onWindowClose
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 780, height: 560),
@@ -693,8 +697,7 @@ final class LibraryWindowController: NSWindowController {
             defer: false
         )
         window.title = "收藏与错题"
-        // 与歌词悬浮窗同为 .floating；show 时再 orderFrontRegardless，确保盖在歌词窗前面
-        window.level = .floating
+        // 普通窗口层级：不强制压在歌词窗或其它应用窗口之上
         window.styleMask.insert(.fullSizeContentView)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
@@ -723,18 +726,23 @@ final class LibraryWindowController: NSWindowController {
         window.contentView = NSHostingView(rootView: root)
         self.windowRef = window
         super.init(window: window)
+        window.delegate = self
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    /// 关闭窗口（× 按钮、⌘W 或程序内关闭）统一走这里：
+    /// 让 AppDelegate 把为回看暂停的音乐恢复或交给正在开始的练习。
+    func windowWillClose(_ notification: Notification) {
+        onWindowClose()
+    }
+
     func show(tab: LibraryTab) {
         model.tab = tab
-        windowRef.level = .floating
-        windowRef.orderFrontRegardless()
-        windowRef.makeKey()
         NSApp.activate(ignoringOtherApps: true)
+        windowRef.makeKeyAndOrderFront(nil)
     }
 
     func closeWindow() {

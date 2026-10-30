@@ -9,6 +9,8 @@ struct PracticeView: View {
     @ObservedObject var translator: TranslationEngine
     @ObservedObject var bank: QuestionBank
     @ObservedObject var mistakes: MistakeBook
+    /// 1 菜单键：键盘和底部按钮共用同一个入口
+    var onOpenMenu: () -> Void
 
     /// 离屏渲染画不了 AppKit 控件，预览时用 Text 顶替输入框
     @Environment(\.practicePreview) private var preview
@@ -25,7 +27,8 @@ struct PracticeView: View {
         translator: TranslationEngine,
         bank: QuestionBank,
         mistakes: MistakeBook,
-        initialSelectedWord: String? = nil
+        initialSelectedWord: String? = nil,
+        onOpenMenu: @escaping () -> Void = {}
     ) {
         self.state = state
         self.settings = settings
@@ -33,6 +36,7 @@ struct PracticeView: View {
         self.translator = translator
         self.bank = bank
         self.mistakes = mistakes
+        self.onOpenMenu = onOpenMenu
         _selectedWord = State(initialValue: initialSelectedWord)
     }
 
@@ -62,8 +66,9 @@ struct PracticeView: View {
         }
         .onChange(of: engine.phase) { _, newValue in
             selectedWord = nil
-            // 换阶段就停掉上一句朗读，绝不把旧句读进下一屏
-            engine.stopReading()
+            // 换阶段只停上一句（不属于当前题的）朗读，绝不把旧句读进下一屏；
+            // 收藏/错题换题后自动开始的本题朗读不能被这一轮界面刷新误杀
+            engine.stopStaleReading()
             if newValue == .asking || newValue == .listening {
                 focusNonce += 1
             }
@@ -73,10 +78,10 @@ struct PracticeView: View {
         }
         .onChange(of: engine.current?.id) { _, _ in
             selectedWord = nil
-            engine.stopReading()
+            engine.stopStaleReading()
         }
         .onChange(of: engine.source) { _, _ in
-            engine.stopReading()
+            engine.stopStaleReading()
         }
         .onAppear {
             if engine.phase == .asking || engine.phase == .listening {
@@ -87,7 +92,7 @@ struct PracticeView: View {
             // 退出练习/回设置页时不留后台朗读
             engine.stopReading()
         }
-        // Esc 仍然兼容；主提示改用 6 返回
+        // Esc 仍然兼容；主提示改用 7 返回
         .onExitCommand {
             engine.exitPractice()
         }
@@ -773,11 +778,14 @@ struct PracticeView: View {
         }
     }
 
-    /// 固定底部操作区。按钮与数字键 1…6 共用 engine 的动作判定：
-    /// 主操作先换行，导航固定在右侧；内容再长也推不走它们。
+    /// 固定底部操作区。按钮与数字键 2…8 共用 engine 的动作判定：
+    /// 1 固定为菜单键（见 `CommandMenu`），主操作先换行，导航固定在右侧；
+    /// 内容再长也推不走它们。
     private func actions(_ s: CGFloat) -> some View {
         HStack(alignment: .top, spacing: 8 * s) {
             WrapRowLayout(spacing: 8 * s, lineSpacing: 6 * s) {
+                // 1 固定是菜单键：这里和键盘走同一个入口
+                capsule("1 菜单", s) { onOpenMenu() }
                 ForEach(PracticeCommand.primaryRow, id: \.self) { command in
                     if let title = engine.commandTitle(command) {
                         let shortcut = legacyShortcut(command)
@@ -822,7 +830,7 @@ struct PracticeView: View {
             return nil
         case .skip:
             return (".", .command)
-        case .backToSetup, .exitPractice:
+        case .backToSetup, .exitPractice, .readAloud:
             return nil
         }
     }

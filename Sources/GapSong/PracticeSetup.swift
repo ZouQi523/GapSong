@@ -1,56 +1,55 @@
 import SwiftUI
 import AppKit
 
-/// 练习设置：选择填空比例（30%–100%）与题目来源，预览挖空效果后开始
+/// 练习设置：只保留填写比例。
+///
+/// 题目来源由键盘菜单的练习入口带入（`练当前歌曲 / 练收藏歌词 / 练错题本`），
+/// 这个页面不再放来源、预览、滑杆和音效开关：
+/// `2` 减少比例、`3` 增加比例（30%–100% 的预设档位），`4` 开始、`7` 返回、`1` 菜单。
 struct PracticeSetupView: View {
     @ObservedObject var state: PlayerState
     @ObservedObject var settings: Settings
     @ObservedObject var engine: PracticeEngine
     @ObservedObject var bank: QuestionBank
     @ObservedObject var mistakes: MistakeBook
+    /// 1 菜单键：键盘和底部按钮共用同一个入口
+    var onOpenMenu: () -> Void
 
-    /// 强度只以 settings 为准：右键菜单改过强度后，这里不会用陈旧的本地值覆盖它
     private var ratio: Double { settings.practiceRatio }
 
-    /// 来源放在引擎里：可见按钮与数字键 3「开始」共用同一份选择
+    /// 来源放在引擎里：菜单入口带入，`4 开始` 与界面共用同一份选择
     private var source: PracticeEngine.Source { engine.setupSource }
+
+    private var choices: [Double] { Settings.practiceRatioChoices }
 
     init(
         state: PlayerState,
         settings: Settings,
         engine: PracticeEngine,
         bank: QuestionBank,
-        mistakes: MistakeBook
+        mistakes: MistakeBook,
+        onOpenMenu: @escaping () -> Void = {}
     ) {
         self.state = state
         self.settings = settings
         self.engine = engine
         self.bank = bank
         self.mistakes = mistakes
+        self.onOpenMenu = onOpenMenu
     }
 
     var body: some View {
         GeometryReader { geo in
             let s = scale(for: geo.size)
-            // 只有内容滚动；「开始 / 返回」固定在底部，不会被长预览或大字号推走
-            VStack(spacing: 10 * s) {
-                ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 10 * s) {
-                        header(s)
-                        Divider().overlay(Color.white.opacity(0.08))
-                        if let warning = bank.storageWarning ?? mistakes.storageWarning {
-                            StorageWarningBanner(text: warning)
-                        }
-                        intensity(s)
-                        previewBlock(s)
-                        sourcePicker(s)
-                        soundToggle(s)
-                    }
-                    .frame(minWidth: geo.size.width, alignment: .topLeading)
-                    .padding(.bottom, 4 * s)
+            VStack(spacing: 0) {
+                header(s)
+                if let warning = bank.storageWarning ?? mistakes.storageWarning {
+                    StorageWarningBanner(text: warning)
+                        .padding(.top, 6 * s)
                 }
-                .scrollBounceBehavior(.basedOnSize)
-
+                Spacer(minLength: 8 * s)
+                center(s)
+                Spacer(minLength: 8 * s)
                 footer(s)
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
@@ -66,8 +65,8 @@ struct PracticeSetupView: View {
         return min(max(base, 0.7), 1.45)
     }
 
-    /// 菜单「字号」的正文系数（默认 24 = 1）：只让预览句/译文和提示文案跟着变，
-    /// 比例滑杆、来源胶囊、按钮仍按窗口缩放，窄窗里不会被字号撑到横向裁切。
+    /// 菜单「字号」的正文系数（默认 24 = 1）：只让提示句跟着变；
+    /// 比例数字和 2/3 按键保持窗口缩放，避免 72 号字把整页撑爆。
     private var fontFactor: CGFloat { Settings.practiceFontFactor(settings.fontSize) }
 
     // MARK: 顶部
@@ -78,113 +77,26 @@ struct PracticeSetupView: View {
             Text("开始练习")
                 .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 15), weight: .semibold))
                 .foregroundStyle(.white.opacity(0.9))
-            Spacer(minLength: 0)
-            if let snap = state.snapshot {
-                Text("\(snap.track.title) · \(snap.track.artist)")
-                    .font(.system(size: PracticeStyle.caption(s, base: 10)))
-                    .foregroundStyle(PracticeStyle.Ink.tertiary)
-                    .lineLimit(1)
-            }
+            Spacer(minLength: 8)
+            sourceBadge(s)
         }
     }
 
-    // MARK: 强度
-
-    private func intensity(_ s: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 7 * s) {
-            HStack(alignment: .firstTextBaseline, spacing: 8 * s) {
-                Text("填写比例")
-                    .font(.system(size: PracticeStyle.control(s, base: 12), weight: .medium))
-                    .foregroundStyle(PracticeStyle.Ink.secondary)
-                Text(Settings.ratioLabel(ratio))
-                    .font(.system(size: 22 * s, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(PracticeStyle.Ink.primary)
-                    .contentTransition(.numericText())
-                Text(difficultyLabel)
-                    .font(.system(size: PracticeStyle.caption(s, base: 10), weight: .medium))
-                    .padding(.horizontal, 7 * s)
-                    .padding(.vertical, 2 * s)
-                    .background(Capsule().fill(Color.white.opacity(0.1)))
-                    .foregroundStyle(PracticeStyle.Ink.secondary)
-                Spacer(minLength: 0)
-                Text("\(previewBlankCount) / \(previewEligibleCount) 词")
-                    .font(.system(size: PracticeStyle.caption(s, base: 10)))
-                    .foregroundStyle(PracticeStyle.Ink.tertiary)
-                    .monospacedDigit()
-            }
-
-            intensitySlider(s)
-
-            HStack(spacing: 6 * s) {
-                ForEach(Settings.practiceRatioChoices, id: \.self) { value in
-                    Button {
-                        settings.practiceRatio = value
-                    } label: {
-                        Text(Settings.ratioLabel(value))
-                            .font(.system(size: PracticeStyle.control(s, base: 10), weight: .medium))
-                            .monospacedDigit()
-                            .padding(.horizontal, 8 * s)
-                            .padding(.vertical, 3.5 * s)
-                            .background(
-                                Capsule().fill(
-                                    abs(value - ratio) < 0.001
-                                        ? Color.white.opacity(0.22)
-                                        : Color.white.opacity(0.07)
-                                )
-                            )
-                            .foregroundStyle(abs(value - ratio) < 0.001 ? PracticeStyle.Ink.primary : PracticeStyle.Ink.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-                Spacer(minLength: 0)
-            }
+    /// 只显示这次会练哪个来源，不在页面上做来源选择
+    private func sourceBadge(_ s: CGFloat) -> some View {
+        HStack(spacing: 4 * s) {
+            Image(systemName: iconName(source))
+                .font(.system(size: max(9, 9 * s), weight: .semibold))
+            Text(sourceBadgeText)
+                .font(.system(size: PracticeStyle.caption(s, base: 10), weight: .medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
+        .padding(.horizontal, 8 * s)
+        .padding(.vertical, 3 * s)
+        .background(Capsule().fill(Color.white.opacity(0.08)))
+        .foregroundStyle(PracticeStyle.Ink.secondary)
     }
-
-    private var difficultyLabel: String {
-        switch ratio {
-        case ..<0.45: return "轻松"
-        case ..<0.65: return "适中"
-        case ..<0.9: return "偏难"
-        default: return "整句"
-        }
-    }
-
-    // MARK: 预览
-
-    private func previewBlock(_ s: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 5 * s) {
-            Text(PracticeBlanks.maskedText(in: sampleText, ratio: ratio))
-                .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 17), weight: .medium, design: .rounded))
-                .foregroundStyle(PracticeStyle.Ink.primary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if let translation = sampleTranslation {
-                Text(translation)
-                    .font(.system(size: PracticeStyle.body(s, factor: fontFactor, base: 12)))
-                    .foregroundStyle(PracticeStyle.Ink.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Text("预览 · \(sampleSourceLabel)")
-                .font(.system(size: PracticeStyle.caption(s, base: 9)))
-                .foregroundStyle(PracticeStyle.Ink.tertiary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12 * s)
-        .padding(.vertical, 9 * s)
-        .background(
-            RoundedRectangle(cornerRadius: 9 * s, style: .continuous)
-                .fill(Color.white.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 9 * s, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-        )
-    }
-
-    // MARK: 来源
 
     private func iconName(_ value: PracticeEngine.Source) -> String {
         switch value {
@@ -194,161 +106,110 @@ struct PracticeSetupView: View {
         }
     }
 
-    private func emptyHelp(_ value: PracticeEngine.Source) -> String {
-        switch value {
-        case .song: return "这首歌没有可听写的英文句子"
-        case .bank: return "收藏还是空的：全文模式点歌词右侧书签"
-        case .mistakes: return "错题本还是空的"
+    private var sourceBadgeText: String {
+        switch source {
+        case .song:
+            let count = engine.songPracticeLineCount
+            let title = state.snapshot?.track.title ?? ""
+            return title.isEmpty ? "当前歌曲 · \(count) 句" : "\(title) · \(count) 句"
+        case .bank:
+            return "收藏歌词 · \(bank.count) 句"
+        case .mistakes:
+            return "错题本 · \(mistakes.count) 条"
         }
     }
 
-    private func sourcePicker(_ s: CGFloat) -> some View {
-        HStack(spacing: 8 * s) {
-            Text("题目来源")
-                .font(.system(size: PracticeStyle.control(s, base: 12), weight: .medium))
+    // MARK: 比例
+
+    private func center(_ s: CGFloat) -> some View {
+        VStack(spacing: 9 * s) {
+            Text("填写比例")
+                .font(.system(size: PracticeStyle.caption(s, base: 10.5), weight: .medium))
+                .foregroundStyle(PracticeStyle.Ink.tertiary)
+
+            Text(Settings.ratioLabel(ratio))
+                .font(.system(size: max(34, 40 * s), weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(PracticeStyle.Ink.primary)
+                .contentTransition(.numericText())
+
+            // 页面唯一一句解释
+            Text("填写比例越高，难度越大")
+                .font(.system(size: PracticeStyle.body(s, factor: min(fontFactor, 1.5), base: 13.5)))
                 .foregroundStyle(PracticeStyle.Ink.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
 
-            sourceChip(.song, title: "当前歌曲", detail: "\(songCount) 句", s: s)
-            sourceChip(.bank, title: "收藏歌词", detail: "\(bank.count) 句", s: s)
-            sourceChip(.mistakes, title: "错题本", detail: "\(mistakes.count) 条", s: s)
-
-            Spacer(minLength: 0)
-        }
-    }
-
-    /// 自绘滑杆：系统 Slider 是 AppKit 控件，离屏预览画不出来
-    private func intensitySlider(_ s: CGFloat) -> some View {
-        GeometryReader { geo in
-            let width = max(geo.size.width, 1)
-            let fraction = CGFloat((ratio - 0.3) / 0.7)
-            let knob = 11 * s
-
-            ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(Color.white.opacity(0.1))
-                    .frame(height: 4 * s)
-                Capsule()
-                    .fill(Color.white.opacity(0.45))
-                    .frame(width: max(4 * s, width * fraction), height: 4 * s)
-                Circle()
-                    .fill(Color.white.opacity(0.92))
-                    .frame(width: knob, height: knob)
-                    .offset(x: min(max(width * fraction - knob / 2, 0), width - knob))
-            }
-            .frame(height: 20 * s)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0).onChanged { value in
-                    setRatio(x: value.location.x, width: width)
+            HStack(spacing: 10 * s) {
+                ratioKey("2", "减少", enabled: canDecrease, s: s) {
+                    engine.adjustSetupRatio(by: -1)
                 }
-            )
+                ratioKey("3", "增加", enabled: canIncrease, s: s) {
+                    engine.adjustSetupRatio(by: 1)
+                }
+            }
+            .padding(.top, 4 * s)
+
+            // 空来源时才显示的必要提示；正常情况下只有上面那一句
+            if !canStart, let hint = footerHint {
+                Text(hint)
+                    .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 10)))
+                    .foregroundStyle(PracticeStyle.Ink.warn)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .frame(height: 20 * s)
+        .frame(maxWidth: .infinity)
     }
 
-    private func setRatio(x: CGFloat, width: CGFloat) {
-        guard width > 1 else { return }
-        let clampedX = min(max(x, 0), width)
-        let raw = 0.3 + (clampedX / width) * 0.7
-        let snapped = (raw * 20).rounded() / 20
-        let value = min(max(snapped, 0.3), 1.0)
-        if abs(value - settings.practiceRatio) > 0.0001 { settings.practiceRatio = value }
-    }
-
-    private func sourceChip(
-        _ value: PracticeEngine.Source,
-        title: String,
-        detail: String,
-        s: CGFloat
+    /// 数字键提示同时是按钮：鼠标用户也能看到并点
+    private func ratioKey(
+        _ key: String,
+        _ title: String,
+        enabled: Bool,
+        s: CGFloat,
+        action: @escaping () -> Void
     ) -> some View {
-        let available: Bool
-        switch value {
-        case .song: available = songCount > 0
-        case .bank: available = bank.count > 0
-        case .mistakes: available = mistakes.count > 0
-        }
-        let selected = source == value
-
-        return Button {
-            engine.selectSetupSource(value)
-        } label: {
-            HStack(spacing: 5 * s) {
-                Image(systemName: iconName(value))
-                    .font(.system(size: max(9, 9 * s), weight: .semibold))
+        Button(action: action) {
+            HStack(spacing: 6 * s) {
+                Text(key)
+                    .font(.system(size: max(11, 12 * s), weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(enabled ? Color.white.opacity(0.95) : Color.white.opacity(0.3))
+                    .frame(width: 24 * s, height: 24 * s)
+                    .background(Circle().fill(Color.white.opacity(enabled ? 0.14 : 0.04)))
                 Text(title)
-                    .font(.system(size: PracticeStyle.control(s, base: 11), weight: .medium))
-                Text(detail)
-                    .font(.system(size: PracticeStyle.caption(s, base: 9.5)).monospacedDigit())
-                    .foregroundStyle(.white.opacity(selected ? 0.55 : 0.3))
+                    .font(.system(size: PracticeStyle.control(s, base: 11.5), weight: .medium))
+                    .foregroundStyle(enabled ? PracticeStyle.Ink.secondary : Color.white.opacity(0.3))
             }
             .padding(.horizontal, 10 * s)
             .padding(.vertical, 5 * s)
-            .background(
-                RoundedRectangle(cornerRadius: 7 * s, style: .continuous)
-                    .fill(Color.white.opacity(selected ? 0.18 : 0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7 * s, style: .continuous)
-                    .strokeBorder(
-                        Color.white.opacity(selected ? 0.28 : 0.08),
-                        lineWidth: 1
-                    )
-            )
-            .foregroundStyle(available ? (selected ? PracticeStyle.Ink.primary : PracticeStyle.Ink.secondary) : PracticeStyle.Ink.faint)
+            .background(Capsule().fill(Color.white.opacity(enabled ? 0.07 : 0.03)))
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .disabled(!available)
-        .help(available ? "" : emptyHelp(value))
+        .disabled(!enabled)
     }
 
-    private func soundToggle(_ s: CGFloat) -> some View {
-        Button {
-            settings.typingSound.toggle()
-        } label: {
-            HStack(spacing: 6 * s) {
-                Image(systemName: settings.typingSound ? "speaker.wave.2.fill" : "speaker.slash")
-                    .font(.system(size: max(10, 10 * s), weight: .semibold))
-                Text("打字机音效")
-                    .font(.system(size: PracticeStyle.control(s, base: 11), weight: .medium))
-                Text(settings.typingSound ? "已开" : "已关")
-                    .font(.system(size: PracticeStyle.caption(s, base: 9.5), weight: .medium).monospacedDigit())
-                    .foregroundStyle(.white.opacity(settings.typingSound ? 0.8 : 0.4))
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 10 * s)
-            .padding(.vertical, 5 * s)
-            .background(
-                RoundedRectangle(cornerRadius: 7 * s, style: .continuous)
-                    .fill(Color.white.opacity(settings.typingSound ? 0.14 : 0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7 * s, style: .continuous)
-                    .strokeBorder(Color.white.opacity(settings.typingSound ? 0.22 : 0.07), lineWidth: 1)
-            )
-            .foregroundStyle(PracticeStyle.Ink.secondary)
-        }
-        .buttonStyle(.plain)
-        .help(settings.typingSound ? "关闭打字机音效" : "打开打字机音效（本地合成，不联网）")
+    private var canDecrease: Bool {
+        ratio > (choices.first ?? 0.3) + 0.001
+    }
+
+    private var canIncrease: Bool {
+        ratio < (choices.last ?? 1.0) - 0.001
     }
 
     // MARK: 底部
 
     private func footer(_ s: CGFloat) -> some View {
         HStack(spacing: 8 * s) {
-            // 只在空来源时留一句必要提示；其余留白，不再常驻解释
-            if let hint = footerHint {
-                Text(hint)
-                    .font(.system(size: PracticeStyle.hint(s, factor: fontFactor, base: 9.5)))
-                    .foregroundStyle(PracticeStyle.Ink.tertiary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
             Spacer(minLength: 6)
+            capsule("1 菜单", s) { onOpenMenu() }
             if let title = engine.commandTitle(.exitPractice) {
                 capsule(title, s) { engine.perform(.exitPractice) }
             }
             capsule(
-                engine.commandTitle(.primary) ?? "3 开始",
+                engine.commandTitle(.primary) ?? "4 开始",
                 s,
                 emphasized: true,
                 enabled: canStart
@@ -365,8 +226,8 @@ struct PracticeSetupView: View {
         guard !canStart else { return nil }
         switch source {
         case .song: return "先播放英文歌，或收藏句子"
-        case .bank: return "全文模式点歌词右侧书签"
-        case .mistakes: return "答错后自动进错题本"
+        case .bank: return "收藏还是空的：全文模式点歌词右侧书签"
+        case .mistakes: return "错题本还是空的：先提交一个错误答案"
         }
     }
 
@@ -395,71 +256,5 @@ struct PracticeSetupView: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
-    }
-
-    // MARK: 数据
-
-    private var songCount: Int { Self.songLineCount(state: state) }
-
-    private static func songLineCount(state: PlayerState) -> Int {
-        guard let lyrics = state.lyrics, !lyrics.lines.isEmpty else { return 0 }
-        return PracticeFilter.practiceableIndices(
-            lines: lyrics.lines,
-            trackDuration: state.snapshot?.track.duration ?? 0
-        ).count
-    }
-
-    private var sampleText: String {
-        if source == .mistakes, let first = mistakes.recentEntries.first {
-            return first.text
-        }
-        if source == .bank, let first = bank.items.first {
-            return first.text
-        }
-        if let lyrics = state.lyrics, !lyrics.lines.isEmpty {
-            let indices = PracticeFilter.practiceableIndices(
-                lines: lyrics.lines,
-                trackDuration: state.snapshot?.track.duration ?? 0
-            )
-            if let first = indices.first {
-                return lyrics.lines[first].text
-            }
-        }
-        if let first = bank.items.first {
-            return first.text
-        }
-        return DemoFixtures.firstLine
-    }
-
-    private var sampleSourceLabel: String {
-        if source == .mistakes, !mistakes.entries.isEmpty { return "错题本" }
-        if source == .bank, !bank.items.isEmpty { return "收藏歌词" }
-        if state.lyrics != nil, songCount > 0 { return "当前歌曲" }
-        if !bank.items.isEmpty { return "收藏歌词" }
-        return "内置例句"
-    }
-
-    private var sampleTranslation: String? {
-        if let text = state.translator.translation(for: sampleText), !text.isEmpty {
-            return text
-        }
-        if let stored = bank.items.first(where: { $0.text == sampleText })?.translation,
-           !stored.isEmpty {
-            return stored
-        }
-        if let stored = mistakes.entries.first(where: { $0.text == sampleText })?.translation,
-           !stored.isEmpty {
-            return stored
-        }
-        if sampleText == DemoFixtures.firstLine { return DemoFixtures.firstTranslation }
-        return nil
-    }
-
-    private var previewBlankCount: Int {
-        PracticeBlanks.blankIndices(in: sampleText, ratio: ratio).count
-    }
-
-    private var previewEligibleCount: Int {
-        PracticeBlanks.words(in: sampleText).filter(\.isEligible).count
     }
 }
