@@ -12,14 +12,14 @@ GapSong is a macOS lyric overlay and English dictation practice tool. This polic
 
 - 不创建账户、不使用自建服务器、不投放广告、不接入统计或分析 SDK，也不做跨应用跟踪。
 - 不录音、不录屏、不读取音频文件或 DRM 内容。只通过 Apple Events（自动化）读取「音乐」中当前曲目的名称、歌手、专辑、时长、播放位置和播放状态，并在练习时暂停、继续或跳转播放。
-- 歌词来自 LRCLIB：查询时会发送歌曲元数据，LRCLIB 能看到你的 IP 地址。我们无法承诺第三方不保留日志。
+- 默认只使用本机家长已批准的固定歌词与译文。只有家长解锁审核窗口并主动获取歌词时才查询 LRCLIB；查询会发送歌曲元数据，LRCLIB 能看到你的 IP 地址。我们无法承诺第三方不保留日志。
 - 翻译使用 macOS 本机 Translation 框架；首次使用某种语言时，系统可能需要从 Apple 下载语言包。
 - 收藏、错题、练习输入、设置、歌词与翻译缓存都保存在本机，不上传到我们的服务器。
 - 歌词缓存保留 90 天是「有效期」，不是到期物理删除；过期条目会被忽略，并在同一首歌再次匹配时被覆盖。
 - 卸载 App 不保证删除系统中的应用容器；需要时可以在系统设置或访达中自行清除。
 - No account, no self-hosted server, no ads, no analytics or statistics SDK, and no cross-app tracking.
 - No audio recording, screen recording, audio file access, or DRM access. The app only uses Apple Events (Automation) to read the current Music track's name, artist, album, duration, playback position, and playback state, and to pause, resume, or seek during practice.
-- Lyrics come from LRCLIB. A lookup sends track metadata, and LRCLIB can see your IP address. We cannot promise that a third party keeps no logs.
+- The app defaults to fixed lyrics and translations approved locally by a parent. Only an unlocked parent review window can initiate an LRCLIB lookup. A lookup sends track metadata, and LRCLIB can see your IP address. We cannot promise that a third party keeps no logs.
 - Translation uses the on-device macOS Translation framework. The first use of a language may require the system to download a language pack from Apple.
 - Favorites, mistakes, practice input, settings, and lyric/translation caches are stored locally and are not uploaded to our servers.
 - The 90-day lyric cache is a validity period, not physical deletion. Expired entries are ignored and are overwritten when the same song is matched again.
@@ -51,14 +51,14 @@ The app does not read audio data, record audio, record the screen, or access DRM
 
 ## 3. 在线歌词查询（LRCLIB）/ Online lyrics lookup (LRCLIB)
 
-当本地没有可用歌词时，GapSong 会通过 HTTPS 请求 LRCLIB（https://lrclib.net）的公开接口。请求中会包含：
+只有在家长解锁审核窗口并主动点击获取预览后，GapSong 才通过 HTTPS 请求 LRCLIB（https://lrclib.net）的公开接口。儿童使用时不会为未知歌曲自动查询网络，也不直接读取未审核缓存。请求中会包含：
 
 - 歌曲名称、歌手名称；
 - 专辑名称与时长（在精确匹配时使用）。
 
 这些信息是查询歌词所必需的。与任何 HTTPS 请求一样，LRCLIB 的服务器可以看到你的 IP 地址、请求时间和 User-Agent 等常规网络信息。LRCLIB 是独立第三方服务，其日志、保留期限和隐私做法由它自己决定并受其政策约束；我们无法承诺它不保留日志，也无法代它作出删除承诺。请勿在 LRCLIB 查询中附加与歌词匹配无关的个人信息。
 
-When no usable lyrics are cached locally, GapSong makes an HTTPS request to LRCLIB's (https://lrclib.net) public API. The request contains:
+Only after a parent unlocks the review window and explicitly requests a preview does GapSong make an HTTPS request to LRCLIB's (https://lrclib.net) public API. Child use does not automatically query unknown songs or read unapproved cached lyrics. The request contains:
 
 - track title and artist name;
 - album name and duration (for exact matching).
@@ -86,6 +86,20 @@ The following data stays on your Mac and is not uploaded automatically:
 - Favorites and mistakes: stored as `questions.json` and `mistakes.json` in the app data directory;
 - Lyric cache, translation cache, and a diagnostic log (`diag.log`). The log may contain the current song title/artist, lyric matching and translation status, and input-source name; it is used only for local troubleshooting;
 - Answers you type during practice, text you paste (the clipboard is read only when you explicitly paste), typing sounds, and system speech are processed locally only and are never sent to our servers. The app does not read clipboard history and does not read the clipboard unless you paste.
+
+## 5.1 家长口令与审核库 / Parent passphrase and approved library
+
+家长口令由家长自行设置，不会发送给开发者、LRCLIB 或 Apple 服务。应用使用随机盐及 PBKDF2-HMAC-SHA256 派生值校验口令，不保存口令明文；校验记录与独立的审核库完整性密钥保存在本机钥匙串。首次设置需要至少 8 个字符并二次确认。每次打开管理入口重新验证，关闭窗口、应用失去活跃或五分钟会话到期后锁定。
+
+The parent sets a local passphrase. It is not sent to the developer, LRCLIB, or Apple services. A random salt and PBKDF2-HMAC-SHA256 derived value are used to verify it; the plaintext passphrase is not stored. The verifier and a separate approved-library integrity key are kept in this Mac's Keychain. Initial setup requires at least eight characters and confirmation. Opening management requires authentication; closing its window, leaving the app, or reaching the five-minute session limit locks it.
+
+`parental-approved.json` 在本机保存家长批准时的曲目标识、原文、时间轴、可选目标语言译文、批准时间、内容摘要和 HMAC 完整性标记。歌词与译文本身没有加密。普通界面只读取这份固定版本，不生成未经批准的新译文或单词释义。家长获取的歌词可能保留在本机歌词缓存；预览译文不写入普通翻译缓存。原有收藏和错题保留，但未符合批准内容的条目不显示或出题。撤销写入失败时当前运行立即停止显示，并提供重试；成功保存前重新启动仍可能读到上一次保存的批准。
+
+`parental-approved.json` locally stores approved track identifiers, lyrics, timing, optional target-language translations, approval time, a content digest, and an HMAC integrity tag. The lyric and translation text itself is not encrypted. The ordinary interface uses this fixed version and does not generate unapproved translations or word meanings. Fetched lyrics may remain in the local lyric cache; preview translations are not written to the ordinary translation cache. Existing favorites and mistakes are preserved, while entries that do not match approved content are hidden and excluded from practice. If saving a revocation fails, the current run stops showing that content and offers a retry; restarting before a successful save may restore the last saved approval.
+
+此功能不核验监护人身份，也不能替代系统账户、Screen Time 或家长对内容适龄性的判断。知道口令者可以管理审核库；能够清空本机数据、重装应用或访问钥匙串的系统管理员不在防护范围内。删除应用容器不保证删除钥匙串条目；应用没有无需验证的口令重置入口。
+
+This feature does not verify guardian identity or replace system accounts, Screen Time, or a parent's judgment about age-appropriate content. Anyone who knows the passphrase can manage approvals. System administrators who can erase local data, reinstall the app, or access Keychain are outside its protection boundary. Removing the app container does not guarantee removal of Keychain items. There is no unauthenticated passphrase-reset entry.
 
 ## 6. 缓存有效期与删除 / Cache lifetime and deletion
 
