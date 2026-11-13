@@ -1,5 +1,20 @@
 # GapSong 隐私政策 / Privacy Policy
 
+## 0.7.0 构建 11 · 2026-11-13
+
+GapSong 在你的 Mac 上读取「音乐」当前播放的歌名、艺人、专辑、时长、播放状态和位置，在本机匹配内置的三首经典英文原词选段。歌曲信息、歌词、翻译、听写输入和练习记录均不发送给开发者或歌词服务。自动化授权用于读取当前曲目及在练习时控制播放。你可在系统设置中撤销授权。
+
+翻译和朗读由 macOS 提供；系统首次使用时可能向 Apple 下载语言包或语音。选择曲目链接会打开 Apple Music，播放与账户由 Apple 管理。GapSong 无需注册，不含广告、分析 SDK 或跨应用跟踪。收藏、错题、设置、诊断和翻译缓存留在本机。旧测试版的练习文件保留在本机，构建 11 使用独立的练习记录。卸载可能保留容器数据。
+
+GapSong matches the current Music track against three bundled historical English verse excerpts on your Mac. With Automation permission it reads title, artist, album, duration, playback state and position, and controls playback during practice. You can revoke this permission in System Settings. Track information, lyrics, translations, typed answers and practice history stay on the Mac. GapSong sends no lookup to a lyrics provider and collects no user data. No account, ads, analytics or tracking.
+
+macOS provides translation and speech and may download language packs or voices from Apple. Opening a song link uses Apple Music under its own policies. Favorites, mistakes, preferences, diagnostics and translation caches are local. Earlier beta practice files remain on the Mac, separate from build 11. Removing the app may leave its container behind. TestFlight feedback you choose to submit is handled by Apple. Support is available through [GitHub Issues](https://github.com/ZouQi523/GapSong/issues); issues are public.
+
+---
+
+## 历史政策 · 适用于使用 LRCLIB 的测试版本 / Earlier LRCLIB-enabled builds
+
+
 最后更新 / Last updated：2026-11-06
 适用版本 / Applies to：GapSong for macOS（含 TestFlight 测试版 / including the TestFlight beta）
 开发者 / Developer：NeoZou
